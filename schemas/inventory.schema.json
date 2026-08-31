@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["as_of", "mode", "status", "accounts", "holdings", "pending_orders", "totals", "diffs", "warnings", "safety"],
+  "properties": {
+    "as_of": {"type": "string"},
+    "mode": {"enum": ["FAST", "FULL"]},
+    "status": {"enum": ["PASS", "WARN", "FAIL", "ABORT"]},
+    "accounts": {"type": "array"},
+    "holdings": {"type": "array"},
+    "pending_orders": {"type": "array"},
+    "totals": {"type": "object"},
+    "diffs": {"type": "array"},
+    "warnings": {"type": "array"},
+    "safety": {"type": "object"},
+    "sidecar_audits": {"type": "object"}
+  }
+}

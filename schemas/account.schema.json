@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["account", "account_value", "cash_available", "evidence"],
+  "properties": {
+    "account": {"enum": ["TFSA", "RRSP", "Non-registered"]},
+    "account_value": {"type": ["string", "null"]},
+    "cash_available": {"type": ["string", "null"]},
+    "evidence": {"type": "array", "items": {"type": "string"}}
+  }
+}

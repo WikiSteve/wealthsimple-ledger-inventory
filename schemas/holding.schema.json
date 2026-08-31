@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["account", "ticker", "security", "quantity", "evidence"],
+  "properties": {
+    "account": {"enum": ["TFSA", "RRSP", "Non-registered"]},
+    "ticker": {"type": "string"},
+    "security": {"type": "string"},
+    "quantity": {"type": "string"},
+    "market_price": {"type": ["string", "null"]},
+    "market_value": {"type": ["string", "null"]},
+    "book_value": {"type": ["string", "null"]},
+    "currency": {"type": ["string", "null"]},
+    "evidence": {"type": "array", "items": {"type": "string"}}
+  }
+}

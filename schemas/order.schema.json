@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["fingerprint", "account", "ticker", "side", "estimated_total", "status", "priority", "detail_status"],
+  "properties": {
+    "fingerprint": {"type": "string"},
+    "account": {"enum": ["TFSA", "RRSP", "Non-registered"]},
+    "ticker": {"type": "string"},
+    "security": {"type": ["string", "null"]},
+    "side": {"type": "string"},
+    "order_type": {"type": ["string", "null"]},
+    "limit_price": {"type": ["string", "null"]},
+    "quantity": {"type": ["string", "null"]},
+    "estimated_total": {"type": "string"},
+    "submitted": {"type": ["string", "null"]},
+    "expires": {"type": ["string", "null"]},
+    "status": {"type": "string"},
+    "priority": {"type": "string"},
+    "detail_status": {"enum": ["detail", "row_only", "cached_detail"]},
+    "evidence": {"type": "array", "items": {"type": "string"}}
+  }
+}

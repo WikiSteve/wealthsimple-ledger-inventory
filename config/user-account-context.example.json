@@ -1,0 +1,6 @@
+{
+  "usd_trading_accounts": {
+    "status": "active",
+    "notes": "Optional user-supplied context. Copy this file outside the repository and edit it for your account."
+  }
+}

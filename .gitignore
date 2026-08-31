@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Captures contain personal financial information and browser evidence.
+runs/
+bundles/
+raw-exports/
+*.zip
+activities-export-*.csv
+holdings-report-*.csv
+
+# User-specific facts and UI state belong outside the repository.
+USER_ACCOUNT_CONTEXT.json
+user-account-context.json
+CURRENT_RUN_STATE.json
+LEDGER.md
+CANONICAL_CONTEXT.md
+.env
+.env.*
+
+# Browser profiles and credentials must never be committed.
+chromium-profile/
+*.pem
+*.key
+cookies*.json
+session*.json

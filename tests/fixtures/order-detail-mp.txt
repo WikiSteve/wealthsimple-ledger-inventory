@@ -1,0 +1,562 @@
+Skip to main
+25
+LMT
+S
+Activity
+Move money
+Add account
+Today
+Download activities
+LMT
+LMT
+Limit buy
+TFSA
+$132.50 CAD
+Pending
+Yesterday
+CTC.A
+Limit buy
+TFSA
+$160.00 CAD
+Pending
+SHOP
+Limit buy
+TFSA
+$135.00 CAD
+Pending
+Transfer
+From: Non-registered
+To: TFSA
+$828.15 CAD
+T
+Limit buy
+TFSA
+$71.65 CAD
+Pending
+June 18, 2026
+NOC
+NOC
+Limit sell
+TFSA
+$74.85 CAD
+Pending
+NOC
+NOC
+Limit sell
+TFSA
+$71.85 CAD
+Pending
+NOC
+NOC
+Limit sell
+TFSA
+$87.80 CAD
+Pending
+INTC
+INTC
+Limit sell
+RRSP
+$160.00 CAD
+Pending
+SPCX
+SPCX
+Limit sell
+TFSA
+$189.75 CAD
+Pending
+SPCX
+SPCX
+Limit buy
+TFSA
+$145.00 CAD
+NOC
+NOC
+Limit buy
+RRSP
+$181.10 CAD
+NOC
+NOC
+Limit buy
+TFSA
+$181.10 CAD
+June 17, 2026
+GOOG
+GOOG
+Limit buy
+RRSP
+$260.00 CAD
+Pending
+AVGO
+AVGO
+Limit buy
+RRSP
+$135.00 CAD
+Pending
+NVDA
+NVDA
+Limit buy
+RRSP
+$200.00 CAD
+Pending
+META
+META
+Limit buy
+TFSA
+$137.50 CAD
+Pending
+MSFT
+MSFT
+Limit buy
+TFSA
+$225.00 CAD
+Pending
+MSFT
+MSFT
+Limit buy
+TFSA
+$245.00 CAD
+Pending
+CRM
+CRM
+Limit sell
+TFSA
+$1,312.50 CAD
+Pending
+ADBE
+ADBE
+Limit sell
+TFSA
+$1,150.00 CAD
+Pending
+CRM
+CRM
+Limit buy
+TFSA
+$900.00 CAD
+ADBE
+ADBE
+Limit buy
+TFSA
+$770.00 CAD
+MP
+Limit buy
+TFSA
+$251.84 CAD
+Pending
+MP
+Limit buy
+TFSA
+$251.66 CAD
+Cancelled
+PYPL
+PYPL
+Limit buy
+TFSA
+$250.00 CAD
+Pending
+NOWS
+NOWS
+Limit buy
+TFSA
+$262.50 CAD
+Pending
+CRM
+CRM
+Limit buy
+TFSA
+$843.75 CAD
+Pending
+ADBE
+ADBE
+Limit buy
+TFSA
+$725.00 CAD
+Pending
+SPIR
+Limit buy
+TFSA
+$43.16 CAD
+Pending
+UFO
+UFO
+Limit buy
+TFSA
+$120.84 CAD
+Pending
+SPCX
+SPCX
+Limit buy
+TFSA
+$100.00 CAD
+Pending
+SPCX
+SPCX
+Limit buy
+TFSA
+$115.00 CAD
+Pending
+SPCX
+SPCX
+Limit buy
+TFSA
+$132.50 CAD
+Pending
+RKLB
+Limit buy
+TFSA
+$237.38 CAD
+Pending
+RKLB
+Limit buy
+TFSA
+$323.70 CAD
+Pending
+MAXQ
+Limit buy
+TFSA
+$180.00 CAD
+Pending
+MAXQ
+Limit buy
+TFSA
+$220.00 CAD
+Pending
+MDA
+Limit buy
+TFSA
+$300.00 CAD
+Pending
+MDA
+Limit buy
+TFSA
+$220.00 CAD
+Pending
+FM
+Limit buy
+TFSA
+$180.00 CAD
+Pending
+LUN
+Limit buy
+RRSP
+$320.00 CAD
+Pending
+MP
+Limit buy
+TFSA
+$323.57 CAD
+Pending
+LMT
+LMT
+Limit buy
+TFSA
+$272.20 CAD
+Pending
+BAM
+Limit buy
+TFSA
+$300.00 CAD
+Pending
+BN
+Limit buy
+TFSA
+$560.00 CAD
+Pending
+NVDA
+NVDA
+Limit buy
+TFSA
+$357.60 CAD
+Pending
+AVGO
+AVGO
+Limit buy
+TFSA
+$240.00 CAD
+Pending
+GOOG
+GOOG
+Limit buy
+TFSA
+$525.00 CAD
+Pending
+META
+META
+Limit buy
+TFSA
+$281.10 CAD
+Pending
+MSFT
+MSFT
+Limit buy
+TFSA
+$490.00 CAD
+Pending
+MSFT
+MSFT
+Limit sell
+TFSA
+$179.80 CAD
+Pending
+MSFT
+MSFT
+Limit sell
+TFSA
+$159.80 CAD
+Pending
+MSFT
+MSFT
+Limit sell
+TFSA
+$69.90 CAD
+Pending
+MDA
+Limit buy
+TFSA
+$361.65 CAD
+Cancelled
+RKLB
+Limit buy
+TFSA
+$2,386.74 CAD
+Cancelled
+MSFT
+MSFT
+Limit buy
+TFSA
+$273.20 CAD
+MDA
+Limit sell
+Non-registered
+$828.15 CAD
+RKLB
+Limit buy
+TFSA
+$2,306.99 CAD
+Cancelled
+Transfer
+From: Non-registered
+To: TFSA
+$59.94 CAD
+June 16, 2026
+Transfer
+From: Non-registered
+To: TFSA
+$954.93 CAD
+June 15, 2026
+Transfer
+From: Non-registered (Managed)
+To: Non-registered
+$59.94 CAD
+TQQQ
+Limit sell
+Non-registered
+$230.07 CAD
+MP
+Limit sell
+Non-registered
+$1,084.97 CAD
+Pending
+Account
+Non-registered
+Status
+Pending
+Submitted
+June 15, 2026
+10:43 am
+Expires
+September 11, 2026
+5:00 pm
+Trading session
+Market hours
+10:30 am–5:00 pm
+Type
+Limit sell
+Limit price
+$79.11 USD
+Entered quantity
+10 shares
+Estimated total value
+$1,084.97 CAD
+Cancel order
+Modify order
+View MP details
+INTC
+Limit sell
+Non-registered
+$359.38 CAD
+LUN
+Limit sell
+Non-registered
+$431.10 CAD
+Pending
+BUZZ
+Limit sell
+Non-registered
+$104.52 CAD
+FM
+Limit sell
+Non-registered
+$180.44 CAD
+MPT
+MPT
+Market sell
+Non-registered
+$13.63 CAD
+BAM
+Fractional sell
+Non-registered
+$33.58 CAD
+BMBL
+Market sell
+Non-registered
+$7.57 CAD
+SPIR
+Market sell
+Non-registered
+$16.50 CAD
+MNTS
+Market sell
+Non-registered
+$0.29 CAD
+FLT
+FLT
+Market sell
+Non-registered
+$1.20 CAD
+CNC
+CNC
+Market sell
+Non-registered
+$7.75 CAD
+F
+Limit sell
+Non-registered
+$70.38 CAD
+Pending
+SPIR
+Limit sell
+Non-registered
+$86.83 CAD
+Pending
+UFO
+UFO
+Limit sell
+Non-registered
+$155.53 CAD
+Pending
+BN
+Limit sell
+Non-registered
+$604.98 CAD
+Pending
+BAM
+Limit sell
+Non-registered
+$71.11 CAD
+Pending
+Transfer
+From: Non-registered
+To: TFSA
+$9,836.55 CAD
+June 12, 2026
+ASTS
+Limit sell
+Non-registered
+$529.89 CAD
+RKLB
+Limit sell
+Non-registered
+$9,221.33 CAD
+June 11, 2026
+META
+META
+Limit buy
+RRSP
+$281.10 CAD
+Expired
+LMT
+LMT
+Limit buy
+RRSP
+$272.20 CAD
+Pending
+GOOG
+GOOG
+Limit buy
+RRSP
+$312.20 CAD
+Pending
+MSFT
+MSFT
+Limit buy
+RRSP
+$245.50 CAD
+Pending
+NVDA
+NVDA
+Limit buy
+RRSP
+$357.60 CAD
+Pending
+June 8, 2026
+GOOG
+GOOG
+Dividend
+RRSP
+Upcoming payment
+June 5, 2026
+LUN
+Dividend
+Non-registered
+Upcoming payment
+June 1, 2026
+F
+Dividend
+Non-registered
+$0.44 CAD
+April 9, 2026
+MPT
+MPT
+Dividend
+Non-registered
+$0.18 CAD
+April 8, 2026
+AVGO
+AVGO
+Dividend
+RRSP
+$0.30 CAD
+LUN
+Dividend
+Non-registered
+$0.28 CAD
+March 31, 2026
+TQQQ
+Dividend
+Non-registered
+$0.14 CAD
+BAM
+Dividend
+Non-registered
+$1.03 CAD
+Load more
+Filters
+Clear
+Quick filters
+Pending
+Orders
+Transfers
+Deposits
+Withdrawals
+Purchases
+Interac e-Transfer
+Bill pay
+Wire transfers
+Search filters
+Search filters...
+Account
+Type
+Holdings
+Timeframe
+Status

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wealthsimple Ledger Inventory
+Comment=Create a read-only local inventory and reconciliation bundle
+Exec=/usr/bin/env bash @REPO_ROOT@/scripts/launch_gui.sh
+Path=@REPO_ROOT@
+Terminal=false
+Categories=Office;Finance;
