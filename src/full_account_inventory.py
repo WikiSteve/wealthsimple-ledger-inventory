@@ -17,6 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from .browser_control_preflight import chromedriver_path, inspect_browser_control
+from .export_receipt import validate_activity_receipt
+from .activity_filter_evidence import FILTER_GROUPS, FILTER_SNAPSHOT_SCRIPT, confirms_unfiltered
+from .order_metadata import METADATA_FUNCTION, validate_metadata, enrich_order
+from .deposit_evidence import (parse_deposit_availability, render_deposits,
+                               compare_deposit_residuals, render_deposit_comparisons)
+from .sell_coverage import (
+    OPEN_STATUSES, open_status_from_lines, order_state, quantity_evidence,
+    sell_coverage, render_coverage, safe_quantity_record,
+)
 
 
 ACCOUNTS = ["TFSA", "RRSP", "Non-registered"]
@@ -141,7 +150,7 @@ CONTROLS_SCRIPT = """
 # and the opened card's exact region (parser input). Read both from the same
 # already-opened DOM snapshot rather than making separate WebDriver round
 # trips for every order/activity detail.
-ACTIVITY_DETAIL_SNAPSHOT_SCRIPT = """
+ACTIVITY_DETAIL_SNAPSHOT_SCRIPT = METADATA_FUNCTION + """
     const wanted = arguments[0];
     const controlId = arguments[1];
     const exact = controlId ? document.getElementById(controlId) : null;
@@ -171,7 +180,19 @@ ACTIVITY_DETAIL_SNAPSHOT_SCRIPT = """
       }) || null);
     const region = header && header.hasAttribute('aria-controls')
       ? document.getElementById(header.getAttribute('aria-controls')) : null;
+    // Identity metadata needs a unique EXACT text match, not the permissive
+    // visible-text parser fallback above. A recycled id alone is insufficient.
+    const metadataHeaders = candidates.filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0
+        && (el.innerText || '').split('\\n').map(p => p.trim()).filter(Boolean).join('\\n')
+          === wantedParts.join('\\n');
+    });
+    let metadata;
+    try { metadata = orderMetadata(metadataHeaders.length === 1 ? metadataHeaders[0] : null); }
+    catch (_) { metadata = {reason: 'metadata_read_failed'}; }
     return {
+      order_metadata: metadata,
       body_text: document.body ? (document.body.innerText || '') : '',
       // The current Activity accordion no longer supplies aria-controls.
       // Only one card may be expanded, so the full body is then the exact
@@ -182,6 +203,7 @@ ACTIVITY_DETAIL_SNAPSHOT_SCRIPT = """
     };
 """
 ACTIVITY_DETAIL_BATCH_SCRIPT = """
+    const activeStatuses = __OPEN_STATUSES__;
     const rows = arguments[0];
     const timeoutMs = arguments[1];
     const done = arguments[arguments.length - 1];
@@ -195,7 +217,7 @@ ACTIVITY_DETAIL_BATCH_SCRIPT = """
       if (!header || !header.matches('button,[role="button"]') ||
           !header.hasAttribute('aria-controls') ||
           header.getAttribute('aria-expanded') !== 'false' ||
-          !parts.includes('Pending')) {
+          !parts.some(value => activeStatuses.includes(value.toLowerCase()))) {
         return null;
       }
       return {row, header};
@@ -241,14 +263,14 @@ ACTIVITY_DETAIL_BATCH_SCRIPT = """
       setTimeout(poll, 10);
     };
     poll();
-"""
+""".replace("__OPEN_STATUSES__", json.dumps(sorted(OPEN_STATUSES)))
 ACTIVITY_DETAIL_BATCH_CLOSE_SCRIPT = """
     const controlIds = new Set(arguments[0]);
     return Array.from(document.querySelectorAll('button[aria-controls][aria-expanded="true"]'))
       .filter(header => controlIds.has(header.id))
       .map(header => {
-        const parts = (header.innerText || '').split('\\n').map(value => value.trim());
-        if (!parts.includes('Pending')) return false;
+        // These exact disclosure IDs were opened by this batch. They may have
+        // filled since opening; cleanup must not depend on the old status.
         header.click();
         return true;
       });
@@ -307,6 +329,8 @@ class RunState:
     account_readiness_traces: list[dict[str, Any]] = field(default_factory=list)
     rebuilt_from: str | None = None
     source_capture_generated_at: str | None = None
+    pending_scan_complete: bool = False
+    deposit_availability: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -589,6 +613,12 @@ class WealthsimpleReader:
                 strict_state_scan=True,
                 screenshot=False,
             )
+            metadata = validate_metadata(snapshot.get("order_metadata"))
+            metadata["observed_at"] = iso_now()
+            metadata_path = Path(evidence["visible_text"]).with_suffix(".order-metadata.json")
+            metadata["evidence_file"] = str(metadata_path)
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            evidence["order_metadata"] = metadata
             return evidence, str(snapshot.get("detail_text") or "")
         except Exception as exc:
             # Evidence is recovered below. Keep the per-occurrence fact in
@@ -1783,29 +1813,65 @@ class WealthsimpleReader:
         self.go_app_path("/app/holdings-dashboard", "Holdings")
         return self.capture_current_holdings_dashboard(timeout)
 
+    def verify_activity_filter_defaults(self) -> bool:
+        """Expand only filter disclosures, inspect selections, then restore layout."""
+        opened = []
+        snapshot = None
+        toggle = """
+        let root = document.querySelector('[data-testid="filter-search"]');
+        while(root && !(root.innerText || '').trim().startsWith('Filters')) root=root.parentElement;
+        if(!root) return false;
+        const matches=Array.from(root.querySelectorAll('button')).filter(e=>e.innerText.trim()===arguments[0]);
+        if(matches.length!==1 || matches[0].getAttribute('aria-expanded')!==arguments[1]) return false;
+        matches[0].click(); return true;
+        """
+        try:
+            for name in FILTER_GROUPS:
+                if self.driver.execute_script(toggle, name, "false"):
+                    opened.append(name)
+                    self.state.log_click("activity-filter-disclosure:" + name)
+            snapshot = self.driver.execute_script(FILTER_SNAPSHOT_SCRIPT, list(FILTER_GROUPS))
+            confirmed = confirms_unfiltered(snapshot)
+            (self.state.out_dir / "logs" / "activity-filter-state.json").write_text(
+                json.dumps({"observed_at": iso_now(), "confirmed_unfiltered": confirmed,
+                            "basis": "explicit_sidebar_defaults", "snapshot": snapshot}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return confirmed
+        except Exception:
+            # Missing/changed sidebar is not proof of an unfiltered feed.
+            return False
+        finally:
+            for name in reversed(opened):
+                try:
+                    if self.driver.execute_script(toggle, name, "true"):
+                        self.state.log_click("activity-filter-disclosure-close:" + name)
+                except Exception:
+                    pass
+
     def capture_activity(self) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
         started = time.monotonic()
+        self.state.pending_scan_complete = False
         self.go_app_path("/app/activity", "Activity")
         self.wait_for_activity_cards("pending-order capture")
         # Activity filters persist across navigation and manual browser use.
         # Start from an explicit all-account view so a prior Account/Type
         # filter cannot silently remove open orders from this audit.
-        if self.click_label("Clear", section="activity-filter-reset"):
+        filters_reset = self.click_label("Clear", section="activity-filter-reset")
+        if filters_reset:
             self.settle(
                 self.disclosure_controls_present,
                 ACTIVITY_FILTER_SETTLE_SECONDS,
                 "activity-filter-reset",
             )
-        # Pending rows can sit far back in the Activity history. Use the
-        # read-only Pending quick filter when available, then load/scroll until
-        # the distinct pending-row set stops growing.
-        if self.click_label("Pending", section="activity-filter"):
-            self.settle(self.disclosure_controls_present, ACTIVITY_FILTER_SETTLE_SECONDS, "activity-filter")
-        if not self.wait_for_pending_activity_cards(
-            "pending-order filtered view"
-        ):
+        else:
+            filters_reset = self.verify_activity_filter_defaults()
+        # Scan the unfiltered feed: the Pending quick filter's inclusion of
+        # partial fills/cancel requests is not an established UI contract.
+        # Only active disclosures are opened; completed trade drawers stay off.
+        if not self.wait_for_activity_cards("all-status open-order discovery"):
             self.state.block(
-                "Pending filter did not render readable order cards or an explicit empty state; refusing to report zero open orders"
+                "Activity did not render readable cards or an explicit empty state; refusing to report zero open orders"
             )
             ev = self.capture(
                 "activity", "activity-pending-render-failure",
@@ -1820,9 +1886,13 @@ class WealthsimpleReader:
         scroll_log: list[dict[str, Any]] = []
         stable_steps = 0
         last_count = -1
+        unparsed_seen: set[str] = set()
+        exhausted = False
+        stable_bottom_steps = 0
         for step in range(30):
             ev = {"url": self.driver.current_url, "visible_text": first_ev["visible_text"], "screenshot": first_ev["screenshot"]}
             controls = self.controls()
+            unparsed_seen.update(unparsed_pending_controls(controls))
             for row in parse_pending_rows_from_controls(controls, ev):
                 rows_by_key[row["stable_row_key"]] = row
             count = len(rows_by_key)
@@ -1841,11 +1911,24 @@ class WealthsimpleReader:
                 self._click(button)
                 time.sleep(1.2)
                 continue
+            # This viewport has actually been parsed. Never declare completion
+            # immediately after scrolling into an as-yet-unread final viewport.
+            at_bottom = bool(self.driver.execute_script(
+                "return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4;"
+            ))
+            stable_bottom_steps = stable_bottom_steps + 1 if at_bottom and stable_steps else 0
+            if stable_bottom_steps >= 3:
+                exhausted = True
+                break
             self.driver.execute_script("window.scrollBy(0, 900);")
             time.sleep(0.5)
-            if stable_steps >= 3:
-                break
-        unparsed = unparsed_pending_controls(self.controls())
+        unparsed_seen.update(unparsed_pending_controls(self.controls()))
+        unparsed = sorted(unparsed_seen)
+        self.state.pending_scan_complete = exhausted and not unparsed and filters_reset
+        if not filters_reset:
+            self.state.warn("all-account Activity filter reset not confirmed; sell coverage scope uncertain")
+        if not exhausted:
+            self.state.warn("pending order scan reached its traversal bound without a stable bottom; sell coverage uncertain")
         if unparsed:
             self.state.warn(
                 f"{len(unparsed)} pending order card(s) could not be parsed into ledger rows and are "
@@ -1860,6 +1943,59 @@ class WealthsimpleReader:
         rows = sorted(rows_by_key.values(), key=order_priority_key)
         self.state.metric("pending_activity_scan", time.monotonic() - started, len(rows))
         return ev, rows
+
+    def capture_pending_deposit_availability(self) -> None:
+        """Read bounded existing EFT deposit disclosures; never funding controls."""
+        texts = [c.get("text", "") for c in self.controls()
+                 if c.get("tag") == "button"
+                 and c.get("text", "").splitlines()[:2] == ["Deposit", "Electronic funds transfer"]
+                 and any(s in c.get("text", "").splitlines() for s in ("In progress", "Pending"))]
+        if len(texts) > 10:
+            self.state.warn("pending deposit disclosure limit exceeded; availability evidence may be incomplete")
+        for index, text in enumerate(texts[:10]):
+            if texts.count(text) != 1:
+                self.state.warn("ambiguous pending deposit cards; availability not inferred")
+                continue
+            opened = False
+            script = """
+            const es=Array.from(document.querySelectorAll('button')).filter(e=>e.innerText.trim()===arguments[0]);
+            if(es.length!==1) return null;
+            const e=es[0];
+            if(arguments[1]==='open' && e.getAttribute('aria-expanded')==='false'){e.click();return {opened:true};}
+            if(arguments[1]==='close' && e.getAttribute('aria-expanded')==='true'){e.click();return {};}
+            return {text:e.parentElement.innerText, opened:false};
+            """
+            try:
+                result = self.driver.execute_script(script, text, "open")
+                if result is None:
+                    continue
+                opened = result.get("opened", False)
+                if opened:
+                    self.state.log_click("deposit-availability:open-existing-disclosure")
+                latest = {}
+                def ready():
+                    nonlocal latest
+                    latest = self.driver.execute_script(script, text, "read") or {}
+                    return "Amount" in latest.get("text", "").splitlines()
+                if not self.settle(ready, 4.0, "deposit-availability"):
+                    self.state.warn("pending deposit disclosure did not render availability evidence")
+                    continue
+                record = parse_deposit_availability(latest["text"])
+                ev = self._write_capture_evidence(
+                    "deposit-details", f"pending-deposit-{index:03d}", latest["text"],
+                    url=redact_account_ids_in_url(self.driver.current_url), title=self.driver.title,
+                    controls=[], strict_state_scan=False, screenshot=False)
+                record.update(observed_at=iso_now(), evidence_file=ev["visible_text"])
+                self.state.deposit_availability.append(record)
+            except Exception as exc:
+                self.state.warn(f"pending deposit availability inspection failed: {type(exc).__name__}; no availability inferred")
+            finally:
+                if opened:
+                    try:
+                        self.driver.execute_script(script, text, "close")
+                        self.state.log_click("deposit-availability:close-existing-disclosure")
+                    except Exception:
+                        self.state.warn("could not restore pending deposit disclosure layout")
 
     def capture_recent_activity(self) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
         """Capture the unfiltered Activity feed separately from Pending orders.
@@ -1898,7 +2034,7 @@ class WealthsimpleReader:
                 # Pending is authoritative only in the dedicated open-order
                 # pass. Keeping it out of the history dataset prevents the UI
                 # and ChatGPT handoff from calling queued orders activity.
-                if row.get("status") == "Pending":
+                if order_state(row.get("status")) == "open":
                     continue
                 if activity_row_is_older_than_cutoff(row):
                     reached_prior_year = True
@@ -2074,8 +2210,9 @@ class WealthsimpleReader:
                         parsed = parse_order_detail_blocks(
                             detail_text, ev, ticker_hint=row["ticker"]
                         )
-                        match = find_matching_detail(row, parsed)
+                        match = find_matching_detail(row, parsed, allow_unbound=True)
                         if match and match.get("confirmation_level") == "detail_confirmed":
+                            match = enrich_order(match, ev.get("order_metadata"))
                             details.append(match)
                         else:
                             copy = dict(row)
@@ -3019,7 +3156,7 @@ def parse_pending_rows_from_controls(controls: list[dict[str, Any]], evidence: d
             action in ORDER_ACTIONS or re.search(r"\b(?:buy|sell)\b", action, re.IGNORECASE)
             for action in parts
         )
-        if "Pending" not in parts or not has_buy_or_sell_action:
+        if not open_status_from_lines(parts) or not has_buy_or_sell_action:
             continue
         row = parse_order_row_text(text)
         if not row:
@@ -3061,12 +3198,10 @@ def unparsed_pending_controls(controls: list[dict[str, Any]]) -> list[str]:
     missed: list[str] = []
     for control in controls:
         text = (control.get("text") or "").strip()
-        if "Pending" not in text:
-            continue
         parts = clean_lines(text)
-        if not any(part in ORDER_ACTIONS for part in parts):
+        if not open_status_from_lines(parts):
             continue
-        if not any(part.startswith("$") and ("CAD" in part or "USD" in part) for part in parts):
+        if not any(part in ORDER_ACTIONS or re.search(r"\b(?:buy|sell)\b", part, re.I) for part in parts):
             continue
         if parse_order_row_text(text) is None:
             missed.append(" / ".join(parts[:5]))
@@ -3148,7 +3283,7 @@ def parse_activity_row_text(text: str) -> dict[str, Any] | None:
     account = next((part for part in parts if part in ACCOUNTS), None)
     action = next((part for part in parts if part in ACTIVITY_ACTIONS), None)
     amount = next((part for part in parts if looks_like_money(part)), None)
-    explicit_status = next((part for part in parts if part in {"Pending", *ACTIVITY_FINAL_STATUSES, "In progress", "Upcoming payment"}), None)
+    explicit_status = next((part for part in parts if order_state(part) == "open" or part in {*ACTIVITY_FINAL_STATUSES, "In progress", "Upcoming payment"}), None)
     if not account or not action:
         return None
     ticker = None
@@ -3394,7 +3529,7 @@ def parse_order_row_text(text: str) -> dict[str, Any] | None:
     action = action or inferred_action
     account = next((p for p in parts if p in ACCOUNTS), None)
     amount = next((p for p in parts if p.startswith("$") and ("CAD" in p or "USD" in p)), None)
-    status = "Pending" if "Pending" in parts else None
+    status = open_status_from_lines(parts)
     ticker = None
     for p in parts:
         if p in {action, account, amount, status, "Transfer"} or p.startswith("$") or p.startswith("From:") or p.startswith("To:"):
@@ -3460,12 +3595,24 @@ def parse_order_detail_blocks(
         status = lines[idx + 3]
         if account not in ACCOUNTS:
             continue
-        window = lines[idx:idx + 90]
+        # Never borrow another order's quantity or security from the next block.
+        end = next((j for j in range(idx + 4, len(lines)) if lines[j] == "Account"), len(lines))
+        window = lines[idx:min(end, idx + 90)]
         submitted = join_label_value(window, "Submitted", 2)
         expiry = join_label_value(window, "Expires", 2)
         type_label = value_after_label(window, "Type")
         limit_price = value_after_label(window, "Limit price")
         quantity = value_after_label(window, "Entered quantity")
+        def single_label(label: str) -> str | None:
+            values = [window[j + 1] if j + 1 < len(window) else ""
+                      for j, text in enumerate(window) if text == label]
+            # Duplicate labels may belong to history/replacement state. Reject
+            # rather than choosing the first even when the values look equal.
+            return values[0] if len(values) == 1 else "ambiguous duplicate label" if values else None
+        quantities = quantity_evidence(
+            single_label("Entered quantity"), single_label("Filled quantity"),
+            single_label("Remaining quantity"),
+        )
         estimated_pair = first_label_value_by_prefix(window, "Estimated total")
         if not (type_label and estimated_pair):
             continue
@@ -3497,6 +3644,8 @@ def parse_order_detail_blocks(
                 ] if not value
             ]
             uncertainty_notes.append("detail pane truncated; missing " + ", ".join(missing))
+        if quantities["remaining_quantity"] is None:
+            uncertainty_notes.append("remaining sell/buy quantity not established by captured labels")
         out.append({
             "stable_row_key": key,
             "fingerprint": key,
@@ -3511,8 +3660,7 @@ def parse_order_detail_blocks(
             "limit_price": limit_price,
             "stop_price": None,
             "quantity": quantity,
-            "filled_quantity": None,
-            "remaining_quantity": quantity,
+            **quantities,
             "submitted_date": split_timestamp_value(submitted)[0],
             "submitted_time": split_timestamp_value(submitted)[1],
             "expiry": expiry,
@@ -3528,6 +3676,7 @@ def parse_order_detail_blocks(
             "settlement_currency": value_currency(estimated_total),
             "reserved_cash_impact": {value_currency(estimated_total) or "UNKNOWN": money_to_float(estimated_total)} if side == "buy" else None,
             "order_currency": value_currency(limit_price) or value_currency(estimated_total),
+            "security_quote_currency": value_currency(limit_price),
             "account_currency": None,
             "fx_conversion": None,
             "source_list_page": evidence.get("url"),
@@ -3579,15 +3728,31 @@ def first_label_value_by_prefix(lines: list[str], prefix: str) -> tuple[str, str
     return None
 
 
-def find_matching_detail(row: dict[str, Any], details: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _matching_order_detail(row: dict[str, Any], details: list[dict[str, Any]], *, allow_unbound: bool = False) -> dict[str, Any] | None:
+    candidates = []
     for detail in details:
-        if detail.get("account") == row.get("account") and detail.get("ticker") == row.get("ticker") and detail.get("estimated_total") == row.get("estimated_total"):
-            merged = dict(row)
-            merged.update(detail)
-            merged["stable_row_key"] = row["stable_row_key"]
-            merged["fingerprint"] = row["stable_row_key"]
-            return merged
-    return None
+        if any(detail.get(k) != row.get(k) for k in ("account", "ticker", "side", "estimated_total")):
+            continue
+        row_id, detail_id = row.get("source_control_id"), detail.get("source_control_id")
+        if row_id and detail_id and row_id != detail_id:
+            continue
+        bound = bool((row_id and row_id == detail_id) or (
+            row.get("stable_row_key") and detail.get("detail_capture_row_key") == row["stable_row_key"]))
+        if bound or (allow_unbound and not detail_id and not detail.get("detail_capture_row_key")):
+            candidates.append(detail)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def find_matching_detail(row: dict[str, Any], details: list[dict[str, Any]], *, allow_unbound: bool = False) -> dict[str, Any] | None:
+    detail = _matching_order_detail(row, details, allow_unbound=allow_unbound)
+    if detail is None:
+        return None
+    merged = {**row, **detail}
+    merged["stable_row_key"] = row["stable_row_key"]
+    merged["fingerprint"] = row["stable_row_key"]
+    merged["source_control_id"] = row.get("source_control_id")
+    merged["detail_capture_row_key"] = row["stable_row_key"]
+    return merged
 
 
 def order_priority_key(row: dict[str, Any]) -> tuple[int, int, str]:
@@ -3597,13 +3762,14 @@ def order_priority_key(row: dict[str, Any]) -> tuple[int, int, str]:
 
 
 def merge_rows_and_details(rows: list[dict[str, Any]], details: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    used_details: set[str] = set()
+    used_details: set[int] = set()
     merged: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     for row in rows:
-        match = find_matching_detail(row, details)
+        raw = _matching_order_detail(row, [d for d in details if id(d) not in used_details])
+        match = find_matching_detail(row, [raw]) if raw is not None else None
         if match:
-            used_details.add(match["stable_row_key"])
+            used_details.add(id(raw))
             match["priority"] = classify_order_priority(match)
             merged.append(match)
         else:
@@ -4278,9 +4444,10 @@ def canonical_activity_rows_from_export(
 def has_fresh_canonical_activity_export(exports: dict[str, Any]) -> bool:
     """Return true only when the supplied Activity export can replace browser history.
 
-    Pending orders always remain a live browser concern. A CSV with no
-    parseable as-of stamp, no rows, or age above the existing 24-hour warning
-    threshold cannot safely replace the browser's settled-activity pass.
+    Pending orders always remain a live browser concern. Freshness must come
+    from a broker as-of stamp or an explicitly validated hash-bound downloader
+    receipt. No rows, unknown freshness or age above the 24-hour threshold
+    cannot safely replace the browser's settled-activity pass.
     """
     provenance = exports.get("activity_export") or {}
     rows = exports.get("activity_export_rows") or []
@@ -4920,7 +5087,8 @@ def redact_export_csv(source: Path, destination: Path, fields: tuple[str, ...]) 
 
 
 def import_exports(
-    state: RunState, activity_export: Path | None, holdings_export: Path | None
+    state: RunState, activity_export: Path | None, holdings_export: Path | None,
+    activity_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Copy explicitly supplied exports into the bundle and record provenance.
 
@@ -4963,6 +5131,18 @@ def import_exports(
             "provenance": "user-supplied Wealthsimple CSV export; canonical for completed activity and holdings",
         }
         age = export_age_hours(as_of)
+        provenance[label]["freshness_basis"] = "broker_as_of" if age is not None else "unknown"
+        if label == "activity_export" and activity_receipt is not None:
+            try:
+                proof = validate_activity_receipt(activity_receipt, source, provenance[label]["sha256"],
+                                                  max_age_hours=EXPORT_STALE_AFTER_HOURS)
+                provenance[label]["download_receipt"] = proof
+                # Never override an explicitly old broker timestamp with a new download.
+                if age is None and not as_of:
+                    age = proof["age_hours"]
+                    provenance[label]["freshness_basis"] = "hash_bound_download_receipt"
+            except ValueError:
+                state.warn("Activity download receipt was rejected; it cannot establish export freshness")
         provenance[label]["age_hours_at_capture"] = None if age is None else round(age, 2)
         provenance[label]["is_stale_at_capture"] = bool(age is not None and age > EXPORT_STALE_AFTER_HOURS)
         if age is None and as_of:
@@ -5049,7 +5229,7 @@ def duplicate_checks(holdings: list[dict[str, Any]], orders: list[dict[str, Any]
 def paired_exit_checks(holdings: list[dict[str, Any]], orders: list[dict[str, Any]], activity: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sell_keys = {
         (o.get("account"), normalize_ticker_for_cross_reference(o.get("ticker")))
-        for o in orders if o.get("side") == "sell"
+        for o in orders if o.get("side") == "sell" and order_state(o.get("status")) != "terminal"
     }
     checks = []
     for h in holdings:
@@ -5147,40 +5327,15 @@ def annotate_activity_identity_confidence(activity: list[dict[str, Any]]) -> int
     return ambiguous
 
 
-def sell_order_coverage(holdings: list[dict[str, Any]], orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    holding_qty = {
-        (h.get("account"), normalize_ticker_for_cross_reference(h.get("ticker"))): quantity_as_float(h.get("quantity"))
-        for h in holdings
-    }
-    findings: list[dict[str, Any]] = []
-    sell_totals: dict[tuple[Any, Any], float] = {}
-    for order in orders:
-        if order.get("side") != "sell":
-            continue
-        key = (order.get("account"), normalize_ticker_for_cross_reference(order.get("ticker")))
-        held = holding_qty.get(key)
-        ordered = quantity_as_float(order.get("quantity"))
-        if held is None:
-            findings.append({"type": "open_sell_without_visible_holding", "account": key[0], "ticker": key[1], "order_quantity": order.get("quantity")})
-        elif ordered is not None and ordered > held:
-            findings.append({"type": "open_sell_exceeds_visible_holding", "account": key[0], "ticker": key[1], "holding_quantity": held, "order_quantity": ordered})
-        if ordered is not None:
-            sell_totals[key] = sell_totals.get(key, 0.0) + ordered
-    for key, total in sell_totals.items():
-        held = holding_qty.get(key)
-        if held is not None and total > held:
-            findings.append({
-                "type": "aggregate_open_sells_exceed_visible_holding",
-                "account": key[0], "ticker": key[1],
-                "holding_quantity": held, "aggregate_order_quantity": total,
-            })
-    return findings
+def sell_order_coverage(holdings: list[dict[str, Any]], orders: list[dict[str, Any]], *, inventory_complete: bool = False) -> list[dict[str, Any]]:
+    """Compare a supplied inventory. Live bundle completeness is gated separately."""
+    return sell_coverage(holdings, orders, normalize_ticker_for_cross_reference, inventory_complete=inventory_complete)
 
 
 def filled_buy_exit_checks(activity: list[dict[str, Any]], orders: list[dict[str, Any]], holdings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sell_keys = {
         (order.get("account"), normalize_ticker_for_cross_reference(order.get("ticker")))
-        for order in orders if order.get("side") == "sell"
+        for order in orders if order.get("side") == "sell" and order_state(order.get("status")) != "terminal"
     }
     currently_held = {
         (holding.get("account"), normalize_ticker_for_cross_reference(holding.get("ticker")))
@@ -5306,6 +5461,7 @@ def detect_raw_exports(out_dir: Path) -> list[str]:
 def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdings: list[dict[str, Any]], orders: list[dict[str, Any]], unresolved_orders: list[dict[str, Any]], activity: list[dict[str, Any]], exports: dict[str, Any] | None = None) -> Path:
     bundle_started = time.monotonic()
     out = state.out_dir
+    orders = [safe_quantity_record(order) for order in orders]
     accounts = [accounts_map[a] for a in ACCOUNTS if a in accounts_map]
     ambiguous_activity_rows = annotate_activity_identity_confidence(activity)
     reserve = compute_cash_reserve(accounts, orders)
@@ -5326,9 +5482,15 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         if a not in accounts_with_holdings and a not in verified_empty_accounts
     ]
     holdings_dependent_checks = ["paired_exit_checks", "filled_buy_exit_checks", "sell_order_coverage"]
+    inventory_complete = state.pending_scan_complete and not unresolved_orders and not state.blockers
     paired = paired_exit_checks(holdings, orders, activity) if holdings_available else []
-    filled_buy_exits = filled_buy_exit_checks(activity, orders, holdings) if holdings_available else []
-    sell_coverage = sell_order_coverage(holdings, orders) if holdings_available else []
+    if not inventory_complete:
+        paired = [p for p in paired if p.get("type") != "holding_without_open_sell_exit"]
+    filled_buy_exits = filled_buy_exit_checks(activity, orders, holdings) if holdings_available and inventory_complete else []
+    coverage_rows = sell_coverage(
+        holdings, orders, normalize_ticker_for_cross_reference,
+        inventory_complete=inventory_complete,
+    ) if holdings_available else []
     export_fills = export_trade_fills(exports.get("activity_export_rows") or [])
     export_activity_analysis = analyze_activity_export(
         exports.get("activity_export_rows") or [],
@@ -5428,6 +5590,8 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         )
         for row in accounts
     }
+    deposit_comparisons = compare_deposit_residuals(
+        total_value_reconciliation, state.deposit_availability, inventory_complete=inventory_complete)
     unexplained_totals = [
         name for name, values in total_value_reconciliation.items()
         if values.get("status") == "residual_unexplained"
@@ -5541,6 +5705,10 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         "all_expected_accounts_captured": not accounts_missing,
         "holdings_count_by_account": count_by(holdings, "account"),
         "open_orders_count_by_account": count_by(orders, "account"),
+        "pending_scan_complete": state.pending_scan_complete,
+        "deposit_availability": state.deposit_availability,
+        "sell_coverage_inventory_complete": inventory_complete,
+        "sell_coverage_scope": "captured all-status Activity inventory after explicit filter reset; not an atomic broker snapshot",
         "detail_confirmed_orders_count_by_account": detail_count_by_account,
         "row_only_orders_count_by_account": count_by(row_only, "account"),
         "recent_activity_count_by_account": count_by(activity, "account"),
@@ -5593,7 +5761,8 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
     write_json(out / "duplicate-checks.json", duplicates)
     write_json(out / "paired-exit-checks.json", paired)
     write_json(out / "filled-buy-exit-checks.json", filled_buy_exits)
-    write_json(out / "sell-order-coverage.json", sell_coverage)
+    write_json(out / "sell-order-coverage.json", coverage_rows)
+    (out / "sell-order-coverage.md").write_text(render_coverage(coverage_rows), encoding="utf-8")
     write_json(out / "cash-reserve-reconciliation.json", reserve)
     write_json(out / "holdings-integrity.json", holdings_integrity)
     write_json(out / "source-reconciliation.json", {
@@ -5624,6 +5793,7 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         (out / "activity-export-analysis.md").write_text(
             render_activity_export_analysis_md(export_activity_analysis), encoding="utf-8")
     write_json(out / "account-total-reconciliation.json", total_value_reconciliation)
+    write_json(out / "deposit-residual-comparison.json", deposit_comparisons)
     write_json(out / "unresolved-row-only-orders.json", unresolved_orders)
     write_json(out / "logs" / "account-readiness.json", state.account_readiness_traces)
 
@@ -5636,15 +5806,22 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
             "open_orders": [o for o in orders if o.get("account") == account],
             "recent_activity": [a for a in activity if a.get("account") == account],
             "buy_order_reserve_math": reserve.get(account),
+            "deposit_residual_comparison": [r for r in deposit_comparisons if r["account"] == account],
             "duplicate_exposures": [d for d in duplicates if account in d.get("accounts", [])],
             "filled_buys_missing_paired_exits": [p for p in paired if p.get("account") == account],
             "completed_filled_buys_missing_paired_exits": [p for p in filled_buy_exits if p.get("account") == account],
+            "sell_order_coverage": [p for p in coverage_rows if p.get("account") == account],
             "warnings": [w for w in state.warnings if account in w],
         }
         write_json(out / f"{slug}-summary.json", summary)
-        (out / f"{slug}-summary.md").write_text(summarize_accounts_markdown(account, accounts, holdings, orders, activity, reserve, duplicates, paired), encoding="utf-8")
+        (out / f"{slug}-summary.md").write_text(
+            summarize_accounts_markdown(account, accounts, holdings, orders, activity, reserve, duplicates, paired)
+            + "\n" + render_coverage(summary["sell_order_coverage"])
+            + "\n".join(render_deposit_comparisons(summary["deposit_residual_comparison"])), encoding="utf-8")
 
     all_summary = {
+        "deposit_residual_comparison": deposit_comparisons,
+        "deposit_availability": state.deposit_availability,
         "status": state.status,
         "accounts": accounts,
         "holdings": holdings,
@@ -5656,7 +5833,7 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         "duplicate_checks": duplicates,
         "paired_exit_checks": paired,
         "filled_buy_exit_checks": filled_buy_exits,
-        "sell_order_coverage": sell_coverage,
+        "sell_order_coverage": coverage_rows,
         "activity_status_counts": status_counts,
         "canonical_export_activity": export_activity_analysis,
         "source_reconciliation": {
@@ -5667,7 +5844,8 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         "blockers": state.blockers,
     }
     write_json(out / "all-accounts-summary.json", all_summary)
-    (out / "all-accounts-summary.md").write_text(render_all_accounts_md(all_summary), encoding="utf-8")
+    (out / "all-accounts-summary.md").write_text(render_all_accounts_md(all_summary)
+        + "\n".join(render_deposit_comparisons(deposit_comparisons)), encoding="utf-8")
     warning_lines = [f"- {x}" for x in state.warnings + state.blockers] or ["- None"]
     (out / "capture-warnings.md").write_text("\n".join(warning_lines) + "\n", encoding="utf-8")
     (out / "README.md").write_text(render_readme(state, manifest), encoding="utf-8")
@@ -5741,7 +5919,7 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
     # Older live builds included Pending rows in recent activity because the
     # Activity feed is unfiltered. Pending belongs exclusively in the detailed
     # open-order ledger; preserve historical final/non-final events only.
-    activity = [row for row in activity if row.get("status") != "Pending"]
+    activity = [row for row in activity if order_state(row.get("status")) != "open"]
     # Earlier collectors labelled a collapsed buy/sell Activity card as
     # Completed/Filled even when Wealthsimple did not show a final status.
     # Preserve the event, but do not let an inference become a fill fact on a
@@ -5768,6 +5946,8 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
         mode="REBUILD",
         rebuilt_from=str(source_dir),
         source_capture_generated_at=old_manifest.get("generated_at"),
+        pending_scan_complete=old_manifest.get("pending_scan_complete") is True,
+        deposit_availability=old_manifest.get("deposit_availability") or [],
     )
     state.warnings = [
         warning for warning in (old_manifest.get("warnings") or [])
@@ -5847,6 +6027,7 @@ def render_all_accounts_md(summary: dict[str, Any]) -> str:
     for o in summary["open_orders"]:
         submitted = " ".join(part for part in [o.get("submitted_date"), o.get("submitted_time")] if part) or "Not shown"
         lines.append(f"| {o.get('account')} | {o.get('ticker')} | {o.get('side_label') or o.get('side')} | {o.get('quantity')} | {o.get('limit_price')} | {submitted} | {o.get('expiry')} | {o.get('estimated_total')} | {o.get('priority')} | {o.get('confirmation_level')} |")
+    lines += ["", render_coverage(summary.get("sell_order_coverage", []))]
     lines += ["", "## Recent Activity", "", f"- Source: `{summary.get('settled_activity_source', 'browser_activity_cards_and_drawers')}`", f"- Capture scope: `{summary.get('activity_capture_scope', 'browser_current_year_activity_cards_and_completed_drawers')}`", "", "```json", json.dumps(summary.get("activity_status_counts", {}), indent=2), "```", ""]
     for row in summary["recent_activity"]:
         lines.append(f"- {row.get('status')}: {row.get('account')} {row.get('ticker') or row.get('activity_type')} {row.get('quantity') or ''} {row.get('execution_price') or ''} {row.get('total_value') or ''} {row.get('date') or ''}")
@@ -5886,6 +6067,8 @@ def render_next_message(manifest: dict[str, Any], summary: dict[str, Any]) -> st
             f"(source capture generated `{manifest.get('source_capture_generated_at') or 'unknown'}`), not a new browser capture at report-generation time.",
             "",
         ]
+    lines += render_deposits(summary.get("deposit_availability") or [])
+    lines += render_deposit_comparisons(summary.get("deposit_residual_comparison") or [])
     for account in ACCOUNTS:
         a = accounts.get(account, {})
         lines.append(
@@ -5971,6 +6154,7 @@ def render_next_message(manifest: dict[str, Any], summary: dict[str, Any]) -> st
     lines += ["", "Duplicate warnings:", *[f"- `{json.dumps(x)}`" for x in summary["duplicate_checks"]]]
     lines += ["", "Filled buys missing paired exits:", *[f"- `{json.dumps(x)}`" for x in summary["paired_exit_checks"] if x.get("type") != "special_attention_status"]]
     lines += ["", "Completed filled buys missing a current open exit:", *[f"- `{json.dumps(x)}`" for x in summary.get("filled_buy_exit_checks", [])]]
+    lines += ["", render_coverage(summary.get("sell_order_coverage", []))]
     lines += ["", "Recent activity status counts:", f"- `{json.dumps(summary.get('activity_status_counts', {}))}`"]
     completed = [row for row in summary["recent_activity"] if row.get("status") in {"Completed", "Filled", "Completed/Filled"}]
     export_is_canonical = bool(summary.get("canonical_export_activity"))
@@ -6040,10 +6224,11 @@ def run_live(
     activity_export: Path | None = None, holdings_export: Path | None = None,
     pending_detail_mode: str = "serial",
     account_capture_mode: str = "preloaded",
+    activity_receipt: Path | None = None,
 ) -> tuple[RunState, Path]:
     ensure_dirs(out_dir)
     state = RunState(out_dir=out_dir, mode=mode)
-    exports = import_exports(state, activity_export, holdings_export)
+    exports = import_exports(state, activity_export, holdings_export, activity_receipt)
     use_csv_fast_path = has_fresh_canonical_activity_export(exports)
     accounts_map: dict[str, dict[str, Any]] = {}
     holdings: list[dict[str, Any]] = []
@@ -6093,6 +6278,7 @@ def run_live(
                 if not state.blockers:
                     print("Phase 3/6: finding all pending orders", flush=True)
                     activity_ev, rows = reader.capture_activity()
+                    reader.capture_pending_deposit_availability()
                     if not state.blockers:
                         print("Phase 4/6: confirming pending order details", flush=True)
                         details, unresolved_from_open = reader.open_order_details(
@@ -6232,6 +6418,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", help="Output directory. Defaults to /tmp/wealthsimple-full-account-inventory-$TS")
     parser.add_argument("--rebuild-from", help="Existing bundle directory to copy and regenerate reports from final JSON truth")
     parser.add_argument("--activity-export", help="Optional Wealthsimple activity CSV export; canonical for completed activity")
+    parser.add_argument("--activity-download-receipt", help="Explicit hash-bound receipt from this tool's Activity downloader")
     parser.add_argument("--holdings-export", help="Optional Wealthsimple holdings CSV export; canonical for positions")
     parser.add_argument(
         "--pending-detail-mode",
@@ -6275,6 +6462,7 @@ def main() -> int:
         Path(args.holdings_export) if args.holdings_export else None,
         args.pending_detail_mode,
         args.account_capture_mode,
+        Path(args.activity_download_receipt) if args.activity_download_receipt else None,
     )
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     counts = {

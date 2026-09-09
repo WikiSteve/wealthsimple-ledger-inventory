@@ -32,6 +32,7 @@ from src.full_account_inventory import (
     render_activity_export_analysis_md,
 )
 from src.browser_control_preflight import chromedriver_path, inspect_browser_control
+from src.export_receipt import activity_download_proof
 
 
 ACTIVITY_URL = "https://my.wealthsimple.com/app/activity"
@@ -62,7 +63,11 @@ def attach_driver() -> "webdriver.Chrome":
     options = Options()
     port = os.environ.get("BROWSER_CONTROL_PORT", "9223")
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    return webdriver.Chrome(service=Service(chromedriver_path()), options=options)
+    driver = webdriver.Chrome(service=Service(chromedriver_path()), options=options)
+    # Foreground the automation tab on ITS display. With the virtual launcher
+    # this cannot steal the operator's desktop focus, and React popovers paint.
+    driver.execute_cdp_cmd("Page.bringToFront", {})
+    return driver
 
 
 def wait_until(probe, timeout: float, interval: float = 0.15) -> bool:
@@ -347,6 +352,7 @@ def download_activity_csv(download_dir: Path) -> dict[str, Any]:
             raise RuntimeError("Activities CSV download could not be identified")
         receipt["csv_path"] = str(csv_path)
         receipt["columns"] = validate_activity_csv(csv_path)
+        receipt.update(activity_download_proof(csv_path))
         receipt["downloaded_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         return receipt
     finally:
@@ -359,13 +365,16 @@ def download_activity_csv(download_dir: Path) -> dict[str, Any]:
             pass
 
 
-def audit_command_for_activity_export(csv_path: Path, mode: str = "FULL", holdings_csv: Path | None = None) -> list[str]:
+def audit_command_for_activity_export(csv_path: Path, mode: str = "FULL", holdings_csv: Path | None = None,
+                                      activity_receipt: Path | None = None) -> list[str]:
     """Command that hands the preserved CSV to the standard audit collector."""
     if mode not in {"FAST", "FULL"}:
         raise ValueError(f"unsupported audit mode: {mode}")
     command = [sys.executable, str(AUDIT_RUNNER), "--mode", mode, "--activity-export", str(csv_path)]
     if holdings_csv is not None:
         command += ["--holdings-export", str(holdings_csv)]
+    if activity_receipt is not None:
+        command += ["--activity-download-receipt", str(activity_receipt)]
     return command
 
 
@@ -427,7 +436,8 @@ def main() -> int:
     if holdings_csv is not None:
         print(f"HOLDINGS_CSV={holdings_csv}", flush=True)
     if args.run_audit:
-        command = audit_command_for_activity_export(Path(receipt["csv_path"]), args.audit_mode, holdings_csv)
+        command = audit_command_for_activity_export(Path(receipt["csv_path"]), args.audit_mode, holdings_csv,
+                                                   receipt_path if not receipt.get("analysis_only") else None)
         print("Starting standard read-only audit with fresh Activity and Holdings CSV controls attached.", flush=True)
         return subprocess.run(command, cwd=ROOT, check=False).returncode
     return 0
