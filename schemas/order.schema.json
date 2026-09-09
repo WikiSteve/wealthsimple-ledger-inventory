@@ -11,6 +11,20 @@
     "order_type": {"type": ["string", "null"]},
     "limit_price": {"type": ["string", "null"]},
     "quantity": {"type": ["string", "null"]},
+    "original_quantity": {"type": ["string", "null"]},
+    "filled_quantity": {"type": ["string", "null"]},
+    "remaining_quantity": {"type": ["string", "null"]},
+    "remaining_quantity_basis": {"enum": ["explicit_remaining", "original_minus_filled", "unknown"]},
+    "security_quote_currency": {"type": ["string", "null"]},
+    "quantity_provenance": {
+      "type": ["object", "null"],
+      "properties": {
+        "version": {"const": 1},
+        "raw": {"type": "object"},
+        "raw_labels": {"type": "object"},
+        "problems": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "estimated_total": {"type": "string"},
     "submitted": {"type": ["string", "null"]},
     "expires": {"type": ["string", "null"]},

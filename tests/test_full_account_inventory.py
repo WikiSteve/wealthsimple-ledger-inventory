@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from src.sell_coverage import quantity_evidence
 
 from src.full_account_inventory import (
     BLOCKING_MODAL_ESCAPE_ATTEMPTS,
@@ -527,30 +528,39 @@ def test_filled_buy_with_no_current_holding_is_not_missing_exit():
 
 
 def test_sell_coverage_flags_only_real_oversell_or_missing_position():
-    holdings = [{"account": "TFSA", "ticker": "NOC", "quantity": "10 shares"}]
+    holdings = [{"account": "TFSA", "ticker": "NOC", "quantity": "10 shares", "current_price_currency": "CAD"}]
     orders = [
         {"account": "TFSA", "ticker": "NOC", "side": "sell", "quantity": "4 shares"},
         {"account": "RRSP", "ticker": "NOC", "side": "sell", "quantity": "2 shares"},
         {"account": "TFSA", "ticker": "NOC", "side": "sell", "quantity": "12 shares"},
     ]
-    findings = sell_order_coverage(holdings, orders)
+    # Legacy quantity-only records must NOT establish excess. The treatment
+    # explicitly supplies independently observed remaining labels in fixtures.
+    assert not any(r["type"] == "open_sell_exceeds_visible_holding" for r in sell_order_coverage(holdings, orders))
+    for idx, order in enumerate(orders):
+        order.update(quantity_evidence(order["quantity"], None, order["quantity"]))
+        order.update(status="Pending", source_control_id=f"fixture-{idx}", security_quote_currency="CAD")
+    findings = sell_order_coverage(holdings, orders, inventory_complete=True)
     kinds = {row["type"] for row in findings}
     assert "open_sell_without_visible_holding" in kinds
     assert "open_sell_exceeds_visible_holding" in kinds
 
 
 def test_sell_coverage_flags_aggregate_ladder_oversell():
-    holdings = [{"account": "TFSA", "ticker": "NOC", "quantity": "10 shares"}]
+    holdings = [{"account": "TFSA", "ticker": "NOC", "quantity": "10 shares", "current_price_currency": "CAD"}]
     orders = [
         {"account": "TFSA", "ticker": "NOC", "side": "sell", "quantity": "6 shares"},
         {"account": "TFSA", "ticker": "NOC", "side": "sell", "quantity": "5 shares"},
     ]
-    findings = sell_order_coverage(holdings, orders)
+    for idx, order in enumerate(orders):
+        order.update(quantity_evidence(order["quantity"], None, order["quantity"]))
+        order.update(status="Pending", source_control_id=f"fixture-{idx}", security_quote_currency="CAD")
+    findings = sell_order_coverage(holdings, orders, inventory_complete=True)
     aggregate = [item for item in findings if item["type"] == "aggregate_open_sells_exceed_visible_holding"]
-    assert aggregate == [{
-        "type": "aggregate_open_sells_exceed_visible_holding",
-        "account": "TFSA", "ticker": "NOC", "holding_quantity": 10.0, "aggregate_order_quantity": 11.0,
-    }]
+    assert len(aggregate) == 1
+    assert aggregate[0]["holding_quantity"] == "10"
+    assert aggregate[0]["aggregate_order_quantity"] == "11"
+    assert aggregate[0]["excess_quantity_lower_bound"] == "1"
 
 
 def test_cash_reserve_does_not_blend_cad_and_usd():
@@ -747,9 +757,12 @@ def test_exchange_suffix_is_normalized_but_share_class_is_preserved():
 
 
 def test_sell_coverage_matches_suffixed_holdings_against_bare_orders():
-    holdings = [{"account": "Non-registered", "ticker": "BN.TO", "quantity": "9 shares"}]
+    holdings = [{"account": "Non-registered", "ticker": "BN.TO", "quantity": "9 shares", "current_price_currency": "CAD"}]
     orders = [{"account": "Non-registered", "ticker": "BN", "side": "sell", "quantity": "9 shares"}]
-    assert sell_order_coverage(holdings, orders) == []
+    assert sell_order_coverage(holdings, orders)[0]["coverage_status"] == "uncertain"
+    orders[0].update(quantity_evidence("9 shares", None, "9 shares"))
+    orders[0].update(status="Pending", security_quote_currency="CAD")
+    assert sell_order_coverage(holdings, orders, inventory_complete=True)[0]["coverage_status"] == "fully_covered"
 
 
 def test_paired_exit_special_ticker_matching_survives_the_to_suffix():
@@ -848,9 +861,10 @@ def test_holdings_present_keeps_dependent_checks_running(tmp_path):
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["holdings_integrity"]["holdings_dependent_checks_skipped"] == []
     coverage = json.loads((tmp_path / "sell-order-coverage.json").read_text())
-    assert [row["type"] for row in coverage] == [
-        "open_sell_exceeds_visible_holding", "aggregate_open_sells_exceed_visible_holding",
-    ]
+    # This legacy fixture has no remaining-quantity evidence. Running the check
+    # must report uncertainty, not resurrect the old original-size oversell.
+    assert [row["type"] for row in coverage] == ["coverage_uncertain"]
+    assert coverage[0]["uncovered_quantity"] is None
 
 
 def test_fresh_export_verified_empty_account_is_not_reported_missing(tmp_path):
@@ -1840,12 +1854,12 @@ def test_accumulate_builds_running_totals(tmp_path):
     assert state.performance["dom_control_inventory"]["count"] == 2
 
 
-def test_pending_capture_clears_persisted_filters_before_selecting_pending(tmp_path):
+def test_pending_capture_scans_unfiltered_activity_after_clear(tmp_path):
     class ActivityDriver:
         current_url = "https://my.wealthsimple.com/app/activity"
 
         def execute_script(self, _script, *_args):
-            return None
+            return True if "return window.innerHeight" in _script else None
 
     state = RunState(out_dir=tmp_path, mode="FULL")
     ensure_dirs(tmp_path)
@@ -1869,7 +1883,8 @@ def test_pending_capture_clears_persisted_filters_before_selecting_pending(tmp_p
 
     _evidence, rows = reader.capture_activity()
 
-    assert clicked[:2] == ["Clear", "Pending"]
+    assert clicked == ["Clear"]
+    assert state.pending_scan_complete is True
     assert rows == []
 
 
@@ -2093,7 +2108,9 @@ def test_activity_detail_batch_uses_exact_pending_headers_and_preserves_evidence
     assert len(state.click_log) == 4
     assert not [event for event in state.safety_log if event["event"] == "activity_detail_batch_fallback"]
     assert "document.getElementById(row.source_control_id)" in ACTIVITY_DETAIL_BATCH_SCRIPT
-    assert "parts.includes('Pending')" in ACTIVITY_DETAIL_BATCH_SCRIPT
+    assert "activeStatuses.includes(value.toLowerCase())" in ACTIVITY_DETAIL_BATCH_SCRIPT
+    assert '"partially filled"' in ACTIVITY_DETAIL_BATCH_SCRIPT
+    assert '"pending cancellation"' in ACTIVITY_DETAIL_BATCH_SCRIPT
     assert "Cancel order" not in ACTIVITY_DETAIL_BATCH_SCRIPT
     assert "Modify order" not in ACTIVITY_DETAIL_BATCH_SCRIPT
 

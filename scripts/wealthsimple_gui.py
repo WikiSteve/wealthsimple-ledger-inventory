@@ -251,6 +251,7 @@ class WealthsimpleAuditApp(ttk.Frame):
             command=self.launch_controlled_browser,
         )
         self.launch_browser_button.grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(controls, text="View browser", command=self.open_browser_viewer).grid(row=0, column=4, padx=8)
         ttk.Label(controls, textvariable=self.browser_status_text).grid(row=0, column=5, padx=(12, 8), sticky="e")
         ttk.Label(controls, textvariable=self.status_text).grid(row=0, column=6, sticky="e")
 
@@ -630,6 +631,14 @@ class WealthsimpleAuditApp(ttk.Frame):
             return
         threading.Thread(target=self._read_process_output, daemon=True).start()
         self.after(150, self._drain_process_output)
+
+    def open_browser_viewer(self) -> None:
+        """Open the detachable local desktop viewer; do not alter capture state."""
+        password_file = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "wealthsimple-ledger-inventory/browser/viewer-password"
+        if not password_file.is_file():
+            messagebox.showinfo("Browser viewer", "Launch the virtual controlled browser first.")
+            return
+        subprocess.Popen([str(ROOT / "scripts/browser-control-view.sh")])
 
     def launch_controlled_browser(self) -> None:
         """Start only the local dedicated browser service without navigating it."""
