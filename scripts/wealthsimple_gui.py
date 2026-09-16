@@ -820,7 +820,23 @@ class WealthsimpleAuditApp(ttk.Frame):
             f"Bundle: {bundle.directory}"
         )
         if warnings:
-            text += "\n\nTop warnings:\n" + "\n".join(f"- {item}" for item in warnings[:5])
+            residual_warnings = [
+                item for item in warnings
+                if "residual" in item.lower() or item.startswith("account total")
+            ]
+            completeness_warnings = [
+                item for item in warnings
+                if "completeness" in item.lower()
+                or "filter defaults" in item.lower()
+                or item.startswith("historical evidence gap")
+                or "pending-transaction count" in item.lower()
+            ]
+            other = [item for item in warnings if item not in residual_warnings + completeness_warnings]
+            text += "\n\nUnexplained residuals / completeness (always shown):\n" + "\n".join(
+                f"- {item}" for item in (residual_warnings + completeness_warnings) or ["None"]
+            )
+            if other:
+                text += "\n\nTop other warnings:\n" + "\n".join(f"- {item}" for item in other[:5])
         if blockers:
             text += "\n\nBlockers:\n" + "\n".join(f"- {item}" for item in blockers[:5])
         if performance:

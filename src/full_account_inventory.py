@@ -18,7 +18,15 @@ from typing import Any
 
 from .browser_control_preflight import chromedriver_path, inspect_browser_control
 from .export_receipt import validate_activity_receipt
-from .activity_filter_evidence import FILTER_GROUPS, FILTER_SNAPSHOT_SCRIPT, confirms_unfiltered
+from .activity_filter_evidence import (
+    FILTER_GROUPS, FILTER_SNAPSHOT_SCRIPT, FILTER_CLEAR_CLICK_SCRIPT,
+    CLEAR_LABEL_CANONICAL, clear_label_matches, confirms_unfiltered,
+)
+from .inventory_completeness import (
+    assess_inventory_completeness, classify_status_token_free_rows,
+    derive_sell_coverage_scope, format_residual_warning, make_count_observation,
+    parse_broker_pending_count, residual_disclosure_rows,
+)
 from .order_metadata import METADATA_FUNCTION, validate_metadata, enrich_order
 from .deposit_evidence import (parse_deposit_availability, render_deposits,
                                compare_deposit_residuals, render_deposit_comparisons)
@@ -331,6 +339,17 @@ class RunState:
     source_capture_generated_at: str | None = None
     pending_scan_complete: bool = False
     deposit_availability: list[dict[str, Any]] = field(default_factory=list)
+    # Evidence for inventory completeness. Actions are provenance; states are evidence.
+    filter_reset_attempted: bool = False
+    filter_reset_click_succeeded: bool = False
+    filter_observed_default_before: bool | None = None
+    filter_observed_default_after: bool | None = None
+    filter_state_path: str | None = None
+    traversal_exhausted: bool = False
+    unparsed_pending_controls: list[str] = field(default_factory=list)
+    broker_pending_count_before: dict[str, Any] | None = None
+    broker_pending_count_after: dict[str, Any] | None = None
+    inventory_completeness: dict[str, Any] | None = None
 
     @property
     def status(self) -> str:
@@ -506,6 +525,50 @@ class WealthsimpleReader:
     def disclosure_controls_present(self) -> bool:
         return bool(self.driver.execute_script(
             "return document.querySelectorAll('[aria-controls]').length > 0;"))
+
+    def activity_filter_sidebar_settled(self) -> bool:
+        """Edge-triggered: targeted groups expanded and control count stable across polls."""
+        result = self.driver.execute_script(
+            """
+            const names = arguments[0];
+            const search = document.querySelector('[data-testid="filter-search"]');
+            let root = search;
+            while (root && !(root.innerText || '').trim().startsWith('Filters')) root = root.parentElement;
+            if (!root) return {ok:false, count:0};
+            const buttons = Array.from(root.querySelectorAll('button'));
+            const expanded = names.every(name => {
+              const matches = buttons.filter(b => b.innerText.trim() === name);
+              return matches.length === 1 && matches[0].getAttribute('aria-expanded') === 'true';
+            });
+            const count = root.querySelectorAll('input[type="checkbox"], input[type="radio"], [aria-pressed]').length;
+            return {ok: expanded, count};
+            """,
+            list(FILTER_GROUPS),
+        ) or {"ok": False, "count": 0}
+        if not result.get("ok"):
+            self._filter_settle_count = None
+            return False
+        count = int(result.get("count") or 0)
+        previous = getattr(self, "_filter_settle_count", None)
+        self._filter_settle_count = count
+        return previous is not None and previous == count and count > 0
+
+    def click_activity_filter_clear(self, label: str = "Clear") -> bool:
+        """Click Clear/Clear-all only inside the Activity filter sidebar."""
+        if label in DANGEROUS_CLICK_TEXT:
+            self.state.log_click(label, blocked=True)
+            return False
+        # Try canonical clear labels inside the sidebar only.
+        labels = [label] if label else list(CLEAR_LABEL_CANONICAL)
+        if label == "Clear":
+            labels = list(CLEAR_LABEL_CANONICAL)
+        for candidate in labels:
+            clicked = self.driver.execute_script(FILTER_CLEAR_CLICK_SCRIPT, candidate, True)
+            if clicked and clicked.get("ok"):
+                self.state.log_click(f"activity-filter-reset:{clicked.get('text') or candidate}", clicked.get("href"))
+                self.settle(self.page_is_interactive, CONTROL_CLICK_SETTLE_SECONDS, "control-click")
+                return True
+        return False
 
     def body_text(self) -> str:
         return self.driver.execute_script("return document.body ? document.body.innerText : '';") or ""
@@ -1813,7 +1876,7 @@ class WealthsimpleReader:
         self.go_app_path("/app/holdings-dashboard", "Holdings")
         return self.capture_current_holdings_dashboard(timeout)
 
-    def verify_activity_filter_defaults(self) -> bool:
+    def verify_activity_filter_defaults(self, *, phase: str = "unspecified") -> bool:
         """Expand only filter disclosures, inspect selections, then restore layout."""
         opened = []
         snapshot = None
@@ -1826,17 +1889,67 @@ class WealthsimpleReader:
         matches[0].click(); return true;
         """
         try:
+            self._filter_settle_count = None
             for name in FILTER_GROUPS:
                 if self.driver.execute_script(toggle, name, "false"):
                     opened.append(name)
                     self.state.log_click("activity-filter-disclosure:" + name)
+            self.settle(
+                self.activity_filter_sidebar_settled,
+                ACTIVITY_FILTER_SETTLE_SECONDS,
+                f"activity-filter-expand-{phase}",
+            )
             snapshot = self.driver.execute_script(FILTER_SNAPSHOT_SCRIPT, list(FILTER_GROUPS))
             confirmed = confirms_unfiltered(snapshot)
-            (self.state.out_dir / "logs" / "activity-filter-state.json").write_text(
-                json.dumps({"observed_at": iso_now(), "confirmed_unfiltered": confirmed,
-                            "basis": "explicit_sidebar_defaults", "snapshot": snapshot}, indent=2) + "\n",
-                encoding="utf-8",
+            logs = self.state.out_dir / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "observed_at": iso_now(),
+                "phase": phase,
+                "confirmed_unfiltered": confirmed,
+                "basis": "explicit_sidebar_defaults",
+                "reset_attempted": self.state.filter_reset_attempted,
+                "reset_click_succeeded": self.state.filter_reset_click_succeeded,
+                "observed_default_before": self.state.filter_observed_default_before,
+                "observed_default_after": self.state.filter_observed_default_after,
+                "snapshot": snapshot,
+            }
+            phase_name = {
+                "before_traversal": "activity-filter-state-before-traversal.json",
+                "after_traversal": "activity-filter-state-after-traversal.json",
+            }.get(phase, f"activity-filter-state-{phase}.json")
+            (logs / phase_name).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            # Canonical file always mirrors the latest known four provenance fields.
+            canonical = {
+                "observed_at": payload["observed_at"],
+                "phase": phase,
+                "confirmed_unfiltered": confirmed,
+                "basis": "explicit_sidebar_defaults",
+                "reset_attempted": self.state.filter_reset_attempted,
+                "reset_click_succeeded": self.state.filter_reset_click_succeeded,
+                "observed_default_before": (
+                    confirmed if phase == "before_traversal"
+                    else self.state.filter_observed_default_before
+                ),
+                "observed_default_after": (
+                    confirmed if phase == "after_traversal"
+                    else self.state.filter_observed_default_after
+                ),
+                "snapshot": snapshot if phase == "before_traversal" else (
+                    json.loads((logs / "activity-filter-state-before-traversal.json").read_text()).get("snapshot")
+                    if (logs / "activity-filter-state-before-traversal.json").exists() else snapshot
+                ),
+                "after_traversal_snapshot": snapshot if phase == "after_traversal" else None,
+            }
+            if phase == "after_traversal" and (logs / "activity-filter-state.json").exists():
+                prior = json.loads((logs / "activity-filter-state.json").read_text(encoding="utf-8"))
+                canonical["snapshot"] = prior.get("snapshot")
+                canonical["observed_default_before"] = prior.get("observed_default_before")
+                canonical["observed_at"] = prior.get("observed_at", canonical["observed_at"])
+            (logs / "activity-filter-state.json").write_text(
+                json.dumps(canonical, indent=2) + "\n", encoding="utf-8"
             )
+            self.state.filter_state_path = str(logs / "activity-filter-state.json")
             return confirmed
         except Exception:
             # Missing/changed sidebar is not proof of an unfiltered feed.
@@ -1849,23 +1962,55 @@ class WealthsimpleReader:
                 except Exception:
                     pass
 
+    def _record_broker_pending_count(self, *, phase: str, source: str) -> dict[str, Any]:
+        text = self.body_text()
+        value = parse_broker_pending_count(text)
+        observation = make_count_observation(
+            value,
+            scope="all_accounts_activity",
+            account_filter="all",
+            status_filter="pending_transactions_label",
+            population_meaning="broker_visible_pending_transactions",
+            timestamp=iso_now(),
+            source=source,
+        )
+        observation["phase"] = phase
+        path = self.state.out_dir / "logs" / f"broker-pending-count-{phase}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(observation, indent=2) + "\n", encoding="utf-8")
+        if value is None:
+            self.state.warn(
+                f"broker pending-transaction count unavailable at {phase}; "
+                "count corroboration downgraded"
+            )
+        return observation
+
     def capture_activity(self) -> tuple[dict[str, str] | None, list[dict[str, Any]]]:
         started = time.monotonic()
         self.state.pending_scan_complete = False
+        self.state.traversal_exhausted = False
+        self.state.unparsed_pending_controls = []
         self.go_app_path("/app/activity", "Activity")
         self.wait_for_activity_cards("pending-order capture")
         # Activity filters persist across navigation and manual browser use.
         # Start from an explicit all-account view so a prior Account/Type
         # filter cannot silently remove open orders from this audit.
-        filters_reset = self.click_label("Clear", section="activity-filter-reset")
-        if filters_reset:
+        self.state.filter_reset_attempted = True
+        self.state.filter_reset_click_succeeded = self.click_activity_filter_clear("Clear")
+        if self.state.filter_reset_click_succeeded:
+            self._filter_settle_count = None
             self.settle(
-                self.disclosure_controls_present,
+                self.activity_filter_sidebar_settled,
                 ACTIVITY_FILTER_SETTLE_SECONDS,
                 "activity-filter-reset",
             )
-        else:
-            filters_reset = self.verify_activity_filter_defaults()
+        # A reset click is provenance only. Always observe defaults.
+        self.state.filter_observed_default_before = self.verify_activity_filter_defaults(
+            phase="before_traversal"
+        )
+        self.state.broker_pending_count_before = self._record_broker_pending_count(
+            phase="before_traversal", source="activity_visible_text"
+        )
         # Scan the unfiltered feed: the Pending quick filter's inclusion of
         # partial fills/cancel requests is not an established UI contract.
         # Only active disclosures are opened; completed trade drawers stay off.
@@ -1924,9 +2069,22 @@ class WealthsimpleReader:
             time.sleep(0.5)
         unparsed_seen.update(unparsed_pending_controls(self.controls()))
         unparsed = sorted(unparsed_seen)
-        self.state.pending_scan_complete = exhausted and not unparsed and filters_reset
-        if not filters_reset:
-            self.state.warn("all-account Activity filter reset not confirmed; sell coverage scope uncertain")
+        self.state.unparsed_pending_controls = unparsed
+        self.state.traversal_exhausted = exhausted
+        self.state.broker_pending_count_after = self._record_broker_pending_count(
+            phase="after_traversal", source="activity_visible_text"
+        )
+        self.state.filter_observed_default_after = self.verify_activity_filter_defaults(
+            phase="after_traversal"
+        )
+
+        filters_proven = (
+            self.state.filter_observed_default_before is True
+            and self.state.filter_observed_default_after is True
+        )
+        self.state.pending_scan_complete = exhausted and not unparsed and filters_proven
+        if not filters_proven:
+            self.state.warn("all-account Activity filter defaults not confirmed; sell coverage scope uncertain")
         if not exhausted:
             self.state.warn("pending order scan reached its traversal bound without a stable bottom; sell coverage uncertain")
         if unparsed:
@@ -2010,7 +2168,7 @@ class WealthsimpleReader:
         # blank shell after a long detail pass. Clear is a view-only filter
         # reset; wait for actual Activity cards rather than treating a loading
         # skeleton as a valid zero-row history.
-        if self.click_label("Clear", section="activity-filter"):
+        if self.click_activity_filter_clear("Clear"):
             time.sleep(0.8)
         # Wealthsimple can retain the scroll offset while replacing a Pending
         # filter with the full feed. Always begin at the newest row.
@@ -4230,11 +4388,11 @@ def reconcile_total_account_value(
         "components_captured": components_captured,
         "residual_analysis": analysis,
         "note": (
+            "Account total is fully explained by visible cash, holdings, and open-buy commitments."
+            if residual == 0 else
             "Residual is not explained by visible cash, holdings, and open-buy commitments. "
             "See residual_analysis for what has been excluded; this capture does not "
             "identify the cause and does not attribute it to a fee."
-            if abs(residual) > 1.0 else
-            "Account total is fully explained by visible cash, holdings, and open-buy commitments."
         ),
     }
 
@@ -5482,22 +5640,9 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         if a not in accounts_with_holdings and a not in verified_empty_accounts
     ]
     holdings_dependent_checks = ["paired_exit_checks", "filled_buy_exit_checks", "sell_order_coverage"]
-    inventory_complete = state.pending_scan_complete and not unresolved_orders and not state.blockers
-    paired = paired_exit_checks(holdings, orders, activity) if holdings_available else []
-    if not inventory_complete:
-        paired = [p for p in paired if p.get("type") != "holding_without_open_sell_exit"]
-    filled_buy_exits = filled_buy_exit_checks(activity, orders, holdings) if holdings_available and inventory_complete else []
-    coverage_rows = sell_coverage(
-        holdings, orders, normalize_ticker_for_cross_reference,
-        inventory_complete=inventory_complete,
-    ) if holdings_available else []
+    # Finalize completeness prerequisites before any downstream gated analysis.
+    fresh_activity_control = has_fresh_canonical_activity_export(exports)
     export_fills = export_trade_fills(exports.get("activity_export_rows") or [])
-    export_activity_analysis = analyze_activity_export(
-        exports.get("activity_export_rows") or [],
-        as_of=(exports.get("activity_export") or {}).get("as_of"),
-    ) if export_fills or exports.get("activity_export_rows") else None
-    # An explicitly empty browser scan is evidence, not a reason to fall back
-    # to the already merged CSV ledger and compare the export with itself.
     if "browser_activity_rows" in exports:
         browser_activity_control_rows = exports["browser_activity_rows"]
     else:
@@ -5526,11 +5671,73 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
             "interpretation": "No Activity CSV was supplied.",
         }
     )
+    status_unknown_classification = classify_status_token_free_rows(
+        browser_activity_control_rows,
+        activity_source_reconciliation,
+        fresh_export=fresh_activity_control,
+    )
+    detail_confirmed_orders = [
+        o for o in orders if o.get("confirmation_level") == "detail_confirmed"
+    ]
+    pending_non_orders = len(state.deposit_availability or [])
+    completeness = assess_inventory_completeness(
+        filter_default_before=state.filter_observed_default_before,
+        filter_default_after=state.filter_observed_default_after,
+        traversal_exhausted=state.traversal_exhausted or state.pending_scan_complete,
+        unparsed_pending_count=len(state.unparsed_pending_controls or []),
+        parsed_orders=len(orders),
+        detail_confirmed_orders=len(detail_confirmed_orders),
+        pending_non_orders=pending_non_orders,
+        unresolved_orders=len(unresolved_orders),
+        status_unknown_classification=status_unknown_classification,
+        fresh_export=fresh_activity_control,
+        blockers=list(state.blockers),
+        broker_count_before=state.broker_pending_count_before,
+        broker_count_after=state.broker_pending_count_after,
+    )
+    state.inventory_completeness = completeness
+    inventory_complete = bool(completeness.get("inventory_complete"))
+    if completeness.get("count_corroboration", {}).get("classification") == "contradiction":
+        severity = completeness["count_corroboration"].get("severity")
+        message = (
+            "broker pending-transaction count contradicts parsed pending orders + "
+            f"pending non-order activities (B={completeness['count_corroboration'].get('b1') or completeness['count_corroboration'].get('b0')}, "
+            f"P+N={completeness['count_corroboration'].get('expected_p_plus_n')})"
+        )
+        if severity == "blocker":
+            state.block(message)
+        else:
+            state.warn(message)
+    if status_unknown_classification.get("fail_closed_missing_export"):
+        state.warn(
+            f"{status_unknown_classification['status_unknown_row_count']} status-token-free "
+            "trade-shaped browser row(s) lack a fresh Activity CSV corroborating source"
+        )
+    elif status_unknown_classification.get("u3_unresolved_count"):
+        state.warn(
+            f"{status_unknown_classification['u3_unresolved_count']} status-token-free "
+            "trade-shaped browser row(s) remain unresolved after source reconciliation "
+            "and are treated as possible missing pending orders"
+        )
+    for code in completeness.get("historical_missing_observations") or []:
+        state.warn(f"historical evidence gap: {code} not_observed_historically")
+
+    paired = paired_exit_checks(holdings, orders, activity) if holdings_available else []
+    if not inventory_complete:
+        paired = [p for p in paired if p.get("type") != "holding_without_open_sell_exit"]
+    filled_buy_exits = filled_buy_exit_checks(activity, orders, holdings) if holdings_available and inventory_complete else []
+    coverage_rows = sell_coverage(
+        holdings, orders, normalize_ticker_for_cross_reference,
+        inventory_complete=inventory_complete,
+    ) if holdings_available else []
+    export_activity_analysis = analyze_activity_export(
+        exports.get("activity_export_rows") or [],
+        as_of=(exports.get("activity_export") or {}).get("as_of"),
+    ) if export_fills or exports.get("activity_export_rows") else None
     holdings_source_reconciliation = reconcile_holdings_sources(
         holdings,
         exports.get("holdings_export_rows") or [],
     )
-    fresh_activity_control = has_fresh_canonical_activity_export(exports)
     if (
         fresh_activity_control
         and activity_source_reconciliation["browser_candidate_count"] == 0
@@ -5580,9 +5787,17 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
     accounts_with_parsed_holdings = (
         {row.get("account") for row in holdings} | verified_empty_accounts
     )
+    capture_date = date.today()
+    if state.source_capture_generated_at:
+        try:
+            capture_date = datetime.fromisoformat(
+                state.source_capture_generated_at.replace("Z", "+00:00")
+            ).date()
+        except ValueError:
+            capture_date = date.today()
     total_value_reconciliation = {
         row["account"]: reconcile_total_account_value(
-            row, holdings, orders, capture_date=date.today(),
+            row, holdings, orders, capture_date=capture_date,
             components_captured=(
                 bool(row.get("available_to_trade") or row.get("available_cash_cad"))
                 and row["account"] in accounts_with_parsed_holdings
@@ -5590,6 +5805,11 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         )
         for row in accounts
     }
+    # Preserve captured arithmetic even when incomplete, but qualify components.
+    if not inventory_complete:
+        for values in total_value_reconciliation.values():
+            if isinstance(values, dict) and "residual_cad" in values:
+                values["inventory_completeness_qualified"] = True
     deposit_comparisons = compare_deposit_residuals(
         total_value_reconciliation, state.deposit_availability, inventory_complete=inventory_complete)
     unexplained_totals = [
@@ -5614,6 +5834,8 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
             "account total could not be reconciled because a current reference FX rate was not captured for: "
             + ", ".join(missing_fx_totals)
         )
+    # Material residual_unexplained keeps its dedicated warning; every nonzero
+    # residual is also disclosed unconditionally regardless of severity grade.
     if unexplained_totals:
         state.warn(
             "account total not fully explained by visible cash, holdings, and open-buy commitments for: "
@@ -5624,6 +5846,10 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
                 for name in unexplained_totals
             )
         )
+    residual_rows = residual_disclosure_rows(total_value_reconciliation)
+    residual_warning = format_residual_warning(residual_rows)
+    if residual_warning:
+        state.warn(residual_warning)
     holdings_integrity = {
         "holdings_parsed": len(holdings),
         "accounts_captured": list(accounts_map),
@@ -5650,6 +5876,33 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
     accounts_missing = [a for a in ACCOUNTS if a not in accounts_map]
     if accounts_missing:
         state.block(f"missing expected accounts: {', '.join(accounts_missing)}")
+        # Late blockers must deny previously computed completeness.
+        completeness = assess_inventory_completeness(
+            filter_default_before=state.filter_observed_default_before,
+            filter_default_after=state.filter_observed_default_after,
+            traversal_exhausted=state.traversal_exhausted or bool(state.pending_scan_complete),
+            unparsed_pending_count=len(state.unparsed_pending_controls or []),
+            parsed_orders=len(orders),
+            detail_confirmed_orders=len(detail_confirmed_orders),
+            pending_non_orders=pending_non_orders,
+            unresolved_orders=len(unresolved_orders),
+            status_unknown_classification=status_unknown_classification,
+            fresh_export=fresh_activity_control,
+            blockers=list(state.blockers),
+            broker_count_before=state.broker_pending_count_before,
+            broker_count_after=state.broker_pending_count_after,
+            historical_missing_observations=list(completeness.get("historical_missing_observations") or []),
+        )
+        state.inventory_completeness = completeness
+        inventory_complete = bool(completeness.get("inventory_complete"))
+        if not inventory_complete:
+            paired = [p for p in paired if p.get("type") != "holding_without_open_sell_exit"]
+            filled_buy_exits = []
+            coverage_rows = sell_coverage(
+                holdings, orders, normalize_ticker_for_cross_reference,
+                inventory_complete=False,
+            ) if holdings_available else []
+    state.pending_scan_complete = bool(inventory_complete)
     if unresolved_orders:
         state.warn(f"{len(unresolved_orders)} open orders remain row-only/unresolved")
     if ambiguous_activity_rows:
@@ -5708,7 +5961,28 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
         "pending_scan_complete": state.pending_scan_complete,
         "deposit_availability": state.deposit_availability,
         "sell_coverage_inventory_complete": inventory_complete,
-        "sell_coverage_scope": "captured all-status Activity inventory after explicit filter reset; not an atomic broker snapshot",
+        "sell_coverage_scope": derive_sell_coverage_scope(
+            reset_attempted=state.filter_reset_attempted,
+            reset_click_succeeded=state.filter_reset_click_succeeded,
+            filter_default_before=state.filter_observed_default_before,
+            filter_default_after=state.filter_observed_default_after,
+            inventory_complete=inventory_complete,
+        ),
+        "inventory_completeness": completeness,
+        "broker_pending_count_before": state.broker_pending_count_before,
+        "broker_pending_count_after": state.broker_pending_count_after,
+        "status_unknown_row_classification": {
+            "status_unknown_row_count": status_unknown_classification.get("status_unknown_row_count"),
+            "export_corroborated_terminal_count": len(
+                status_unknown_classification.get("export_corroborated_terminal") or []
+            ),
+            "proven_pending_order_count": len(
+                status_unknown_classification.get("proven_pending_order") or []
+            ),
+            "unresolved_review_required_count": status_unknown_classification.get("u3_unresolved_count"),
+            "corroboration_ran": status_unknown_classification.get("corroboration_ran"),
+        },
+        "unexplained_residuals": residual_rows,
         "detail_confirmed_orders_count_by_account": detail_count_by_account,
         "row_only_orders_count_by_account": count_by(row_only, "account"),
         "recent_activity_count_by_account": count_by(activity, "account"),
@@ -5799,6 +6073,7 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
 
     for account in ACCOUNTS:
         slug = ACCOUNT_SLUG[account]
+        account_residuals = [r for r in residual_rows if r["account"] == account]
         summary = {
             "account": account,
             "balance": accounts_map.get(account),
@@ -5806,16 +6081,42 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
             "open_orders": [o for o in orders if o.get("account") == account],
             "recent_activity": [a for a in activity if a.get("account") == account],
             "buy_order_reserve_math": reserve.get(account),
+            "account_total_reconciliation": total_value_reconciliation.get(account),
+            "unexplained_residuals": account_residuals,
             "deposit_residual_comparison": [r for r in deposit_comparisons if r["account"] == account],
             "duplicate_exposures": [d for d in duplicates if account in d.get("accounts", [])],
             "filled_buys_missing_paired_exits": [p for p in paired if p.get("account") == account],
             "completed_filled_buys_missing_paired_exits": [p for p in filled_buy_exits if p.get("account") == account],
             "sell_order_coverage": [p for p in coverage_rows if p.get("account") == account],
-            "warnings": [w for w in state.warnings if account in w],
+            "inventory_completeness": completeness,
+            "warnings": [w for w in state.warnings if account in w] + [
+                w for w in state.warnings
+                if w.startswith("account total residual unexplained")
+                or w.startswith("account total not fully explained")
+                or w.startswith("historical evidence gap")
+                or "filter defaults not confirmed" in w
+                or "inventory" in w.lower()
+            ],
         }
+        # Deduplicate warnings while preserving order.
+        seen_w: set[str] = set()
+        summary["warnings"] = [w for w in summary["warnings"] if not (w in seen_w or seen_w.add(w))]
         write_json(out / f"{slug}-summary.json", summary)
+        residual_md = ""
+        if account_residuals:
+            residual_md = "\n## Account total residual\n\n" + "\n".join(
+                f"- Unexplained residual: `{r['residual_cad']} CAD` "
+                f"(status `{r.get('status')}`, classification `{r.get('classification')}`)"
+                for r in account_residuals
+            ) + "\n"
+        elif total_value_reconciliation.get(account, {}).get("residual_cad") == 0:
+            residual_md = "\n## Account total residual\n\n- Residual: `0 CAD` (fully explained)\n"
         (out / f"{slug}-summary.md").write_text(
             summarize_accounts_markdown(account, accounts, holdings, orders, activity, reserve, duplicates, paired)
+            + residual_md
+            + "\n## Capture warnings\n\n"
+            + ("\n".join(f"- {w}" for w in summary["warnings"]) or "- None")
+            + "\n"
             + "\n" + render_coverage(summary["sell_order_coverage"])
             + "\n".join(render_deposit_comparisons(summary["deposit_residual_comparison"])), encoding="utf-8")
 
@@ -5840,6 +6141,9 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
             "activity": activity_source_reconciliation,
             "holdings": holdings_source_reconciliation,
         },
+        "account_total_reconciliation": total_value_reconciliation,
+        "unexplained_residuals": residual_rows,
+        "inventory_completeness": completeness,
         "warnings": state.warnings,
         "blockers": state.blockers,
     }
@@ -5847,7 +6151,41 @@ def write_bundle(state: RunState, accounts_map: dict[str, dict[str, Any]], holdi
     (out / "all-accounts-summary.md").write_text(render_all_accounts_md(all_summary)
         + "\n".join(render_deposit_comparisons(deposit_comparisons)), encoding="utf-8")
     warning_lines = [f"- {x}" for x in state.warnings + state.blockers] or ["- None"]
-    (out / "capture-warnings.md").write_text("\n".join(warning_lines) + "\n", encoding="utf-8")
+    # Dedicated summaries must survive CLI/GUI truncation of the general warning list.
+    residual_section = ["", "## Unexplained residuals", ""]
+    if residual_rows:
+        residual_section += [
+            f"- {r['account']}: residual `{r['residual_cad']} CAD` "
+            f"(status `{r.get('status')}`, classification `{r.get('classification')}`)"
+            for r in residual_rows
+        ]
+    else:
+        residual_section.append("- None")
+    completeness_section = [
+        "", "## Inventory completeness", "",
+        f"- State: `{completeness.get('completeness_state')}`",
+        f"- Complete: `{completeness.get('inventory_complete')}`",
+        f"- Reasons: `{', '.join(completeness.get('reason_codes') or []) or 'none'}`",
+        f"- Count corroboration: `{(completeness.get('count_corroboration') or {}).get('classification')}`",
+    ]
+    (out / "capture-warnings.md").write_text(
+        "\n".join(["# Capture warnings", ""] + warning_lines + residual_section + completeness_section) + "\n",
+        encoding="utf-8",
+    )
+    write_json(out / "status-unknown-row-classification.json", {
+        "export_corroborated_terminal": [
+            {k: row.get(k) for k in ("account", "ticker", "side", "status", "total_value", "source_control_id", "stable_row_key")}
+            for row in status_unknown_classification.get("export_corroborated_terminal") or []
+        ],
+        "proven_pending_order": status_unknown_classification.get("proven_pending_order") or [],
+        "unresolved_review_required": [
+            {k: row.get(k) for k in ("account", "ticker", "side", "status", "total_value", "source_control_id", "stable_row_key")}
+            for row in status_unknown_classification.get("unresolved_review_required") or []
+        ],
+        "u3_unresolved_count": status_unknown_classification.get("u3_unresolved_count"),
+        "corroboration_ran": status_unknown_classification.get("corroboration_ran"),
+        "fail_closed_missing_export": status_unknown_classification.get("fail_closed_missing_export"),
+    })
     (out / "README.md").write_text(render_readme(state, manifest), encoding="utf-8")
     (out / "next-message-for-chatgpt.md").write_text(render_next_message(manifest, all_summary), encoding="utf-8")
     write_json(out / "logs" / "click-log.json", state.click_log)
@@ -5945,18 +6283,21 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
         out_dir=out_dir,
         mode="REBUILD",
         rebuilt_from=str(source_dir),
-        source_capture_generated_at=old_manifest.get("generated_at"),
-        pending_scan_complete=old_manifest.get("pending_scan_complete") is True,
+        source_capture_generated_at=old_manifest.get("generated_at") or old_manifest.get("source_capture_generated_at"),
+        # Never inherit an old success Boolean. Reassess from retained evidence.
+        pending_scan_complete=False,
         deposit_availability=old_manifest.get("deposit_availability") or [],
     )
+    # Preserve residual and completeness warnings; only drop warnings that are
+    # re-derived from current evidence with a more specific replacement cause.
     state.warnings = [
         warning for warning in (old_manifest.get("warnings") or [])
         if not (
             (warning.startswith("visible non-target account card found:") and "cash-msb" in warning.lower())
             or warning.startswith("user-reported USD trading-account access needs reconfirmation")
             or "browser/export holding quantity difference(s) require review" in warning
-            or warning.startswith("account total could not be reconciled")
-            or warning.startswith("account total not fully explained")
+            # Replaced by historical evidence-gap / new filter-default wording.
+            or warning.startswith("all-account Activity filter reset not confirmed")
         )
     ]
     state.blockers = list(old_manifest.get("blockers") or [])
@@ -5972,12 +6313,99 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
             state.performance = json.loads(performance_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             state.warn("copied performance log was invalid and could not be preserved")
+
+    # Rehydrate filter / broker-count evidence from retained capture artifacts.
+    filter_state_path = out_dir / "logs" / "activity-filter-state.json"
+    if filter_state_path.exists():
+        try:
+            filter_state = json.loads(filter_state_path.read_text(encoding="utf-8"))
+            snapshot = filter_state.get("snapshot")
+            observed = confirms_unfiltered(snapshot) if snapshot is not None else None
+            # Reinterpret retained snapshot; do not invent a post-traversal observation.
+            state.filter_observed_default_before = observed
+            state.filter_observed_default_after = None  # not_observed_historically
+            state.filter_reset_attempted = bool(filter_state.get("reset_attempted", False))
+            state.filter_reset_click_succeeded = bool(filter_state.get("reset_click_succeeded", False))
+            # Legacy captures recorded confirmed_unfiltered under the old verifier.
+            if "reset_attempted" not in filter_state and "explicit filter reset" in str(
+                old_manifest.get("sell_coverage_scope") or ""
+            ):
+                # Unsupported explicit-reset wording: do not invent a reset action.
+                state.filter_reset_attempted = False
+                state.filter_reset_click_succeeded = False
+        except json.JSONDecodeError:
+            state.warn("copied activity filter state was invalid and could not be preserved")
+    else:
+        state.filter_observed_default_before = None
+        state.filter_observed_default_after = None
+
+    # Traversal exhaustion from scroll log / old pending_scan signal without inventing filter proof.
+    scroll_log_path = out_dir / "logs" / "activity-scroll-log.json"
+    if scroll_log_path.exists():
+        try:
+            scroll_log = json.loads(scroll_log_path.read_text(encoding="utf-8"))
+            state.traversal_exhausted = bool(scroll_log) and old_manifest.get("pending_scan_complete") is not False
+            # Prefer explicit stable-bottom evidence when the old run claimed incomplete only for filters.
+            if old_manifest.get("pending_scan_complete") is False and (
+                old_manifest.get("warnings") or []
+            ) == ["all-account Activity filter reset not confirmed; sell coverage scope uncertain"]:
+                state.traversal_exhausted = True
+            elif old_manifest.get("pending_scan_complete") is True:
+                state.traversal_exhausted = True
+        except json.JSONDecodeError:
+            state.traversal_exhausted = False
+
+    # Broker count from retained activity-start text when available.
+    activity_start = out_dir / "visible-text" / "activity" / "activity-start.txt"
+    if activity_start.exists():
+        count_value = parse_broker_pending_count(activity_start.read_text(encoding="utf-8", errors="replace"))
+        # Historical captures typically retain one reading; treat as after-or-only partial.
+        observation = make_count_observation(
+            count_value,
+            scope="all_accounts_activity",
+            account_filter="all",
+            status_filter="pending_transactions_label",
+            population_meaning="broker_visible_pending_transactions",
+            timestamp=old_manifest.get("generated_at"),
+            source="historical_activity_start_visible_text",
+        )
+        state.broker_pending_count_before = None
+        state.broker_pending_count_after = observation
+
+    # Restore export inputs so rebuild does not silently drop CSV corroboration.
+    exports: dict[str, Any] = {}
+    provenance_path = out_dir / "exports-provenance.json"
+    if provenance_path.exists():
+        try:
+            exports.update(json.loads(provenance_path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            state.warn("copied exports provenance was invalid")
+    for key, filename in (
+        ("activity_export_rows", "activity-export-rows.json"),
+        ("holdings_export_rows", "holdings-export-rows.json"),
+    ):
+        path = out_dir / filename
+        if path.exists():
+            try:
+                exports[key] = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                state.warn(f"copied {filename} was invalid")
+    browser_rows_path = out_dir / "browser-activity-control-rows.json"
+    if browser_rows_path.exists():
+        try:
+            exports["browser_activity_rows"] = json.loads(browser_rows_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state.warn("copied browser activity control rows were invalid")
+
     for order in orders:
         order["priority"] = classify_order_priority(order)
 
-    zip_path = write_bundle(state, accounts_map, holdings, orders, unresolved, activity)
+    zip_path = write_bundle(state, accounts_map, holdings, orders, unresolved, activity, exports=exports)
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     manifest["rebuilt_from"] = str(source_dir)
+    # Preserve original capture timestamp; report generation time is separate.
+    if state.source_capture_generated_at:
+        manifest["source_capture_generated_at"] = state.source_capture_generated_at
     manifest["generated_at"] = iso_now()
     manifest["zip_path"] = str(zip_path)
     manifest["output_dir"] = str(out_dir)
@@ -6033,6 +6461,25 @@ def render_all_accounts_md(summary: dict[str, Any]) -> str:
         lines.append(f"- {row.get('status')}: {row.get('account')} {row.get('ticker') or row.get('activity_type')} {row.get('quantity') or ''} {row.get('execution_price') or ''} {row.get('total_value') or ''} {row.get('date') or ''}")
     lines += ["", "## Warnings", ""]
     lines += [f"- {w}" for w in summary["warnings"]] or ["- None"]
+    residuals = summary.get("unexplained_residuals") or residual_disclosure_rows(
+        summary.get("account_total_reconciliation") or {}
+    )
+    lines += ["", "## Unexplained residuals", ""]
+    if residuals:
+        lines += [
+            f"- {r['account']}: residual `{r['residual_cad']} CAD` "
+            f"(status `{r.get('status')}`, classification `{r.get('classification')}`)"
+            for r in residuals
+        ]
+    else:
+        lines.append("- None")
+    completeness = summary.get("inventory_completeness") or {}
+    lines += [
+        "", "## Inventory completeness", "",
+        f"- State: `{completeness.get('completeness_state', 'unknown')}`",
+        f"- Complete: `{completeness.get('inventory_complete')}`",
+        f"- Reasons: `{', '.join(completeness.get('reason_codes') or []) or 'none'}`",
+    ]
     lines += ["", "## Blockers", ""]
     lines += [f"- {b}" for b in summary["blockers"]] or ["- None"]
     return "\n".join(lines) + "\n"
@@ -6069,6 +6516,25 @@ def render_next_message(manifest: dict[str, Any], summary: dict[str, Any]) -> st
         ]
     lines += render_deposits(summary.get("deposit_availability") or [])
     lines += render_deposit_comparisons(summary.get("deposit_residual_comparison") or [])
+    residuals = summary.get("unexplained_residuals") or manifest.get("unexplained_residuals") or []
+    lines += ["", "Unexplained account-total residuals (materiality does not hide these):"]
+    if residuals:
+        lines += [
+            f"- {r['account']}: residual {r['residual_cad']} CAD "
+            f"(status {r.get('status')}, classification {r.get('classification')})"
+            for r in residuals
+        ]
+    else:
+        lines.append("- None")
+    completeness = summary.get("inventory_completeness") or manifest.get("inventory_completeness") or {}
+    lines += [
+        "",
+        "Inventory completeness:",
+        f"- state={completeness.get('completeness_state')}; complete={completeness.get('inventory_complete')}; "
+        f"reasons={', '.join(completeness.get('reason_codes') or []) or 'none'}; "
+        f"count_corroboration={(completeness.get('count_corroboration') or {}).get('classification')}",
+        f"- sell_coverage_scope: {manifest.get('sell_coverage_scope')}",
+    ]
     for account in ACCOUNTS:
         a = accounts.get(account, {})
         lines.append(
