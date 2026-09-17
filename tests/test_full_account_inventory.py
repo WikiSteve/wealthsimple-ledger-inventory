@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -406,6 +407,64 @@ def test_chatgpt_handoff_ignores_non_status_findings_for_special_tickers():
     text = render_next_message(manifest, summary)
 
     assert "- QCOM: activity_seen" in text
+    assert "Current holdings with no open sell orders:" in text
+    assert "Filled buys missing paired exits:" not in text
+    assert '"ticker": "QCOM"' in text  # holding-level row still listed under current holdings
+
+
+def test_handoff_and_gui_use_current_holding_heading_not_filled_buy_wording():
+    """Visible wording must describe current holdings, not filled-buy derivation."""
+    from scripts.wealthsimple_gui import WealthsimpleAuditApp
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from pathlib import Path
+
+    summary = {
+        "accounts": [],
+        "holdings": [{"account": "RRSP", "ticker": "BIPC.TO", "quantity": "4 shares"}],
+        "open_orders": [],
+        "paired_exit_checks": [{
+            "type": "holding_without_open_sell_exit",
+            "account": "RRSP",
+            "ticker": "BIPC.TO",
+            "uncovered_quantity": "4",
+            "basis": "current_holding_inventory",
+        }],
+        "duplicate_checks": [],
+        "filled_buy_exit_checks": [],
+        "recent_activity": [],
+        "activity_status_counts": {},
+        "sell_order_coverage": [],
+        "cash_reserve_reconciliation": {},
+        "warnings": [],
+        "blockers": [],
+    }
+    handoff = render_next_message({"zip_path": "/tmp/x.zip", "status": "OK", "accounts_seen": ["RRSP"]}, summary)
+    assert "Current holdings with no open sell orders:" in handoff
+    assert "Filled buys missing paired exits:" not in handoff
+    assert "Potential missing exits" not in handoff
+    assert "Lot-level outstanding claims are not inferred" in handoff
+    assert "No per-buy actionable missing-exit claims" in handoff
+
+    # GUI checks pane uses the same current-state heading.
+    app = SimpleNamespace(
+        _load_json=lambda path, default: {
+            "duplicate-checks.json": [],
+            "paired-exit-checks.json": summary["paired_exit_checks"],
+            "filled-buy-exit-checks.json": [],
+            "sell-order-coverage.json": [],
+            "cash-reserve-reconciliation.json": {},
+        }.get(path.name, default),
+        checks_text=Mock(),
+        _set_text=Mock(),
+    )
+    bundle = SimpleNamespace(directory=Path("/tmp/fake-bundle"))
+    WealthsimpleAuditApp._render_checks(app, bundle)
+    rendered = app._set_text.call_args.args[1]
+    assert "Current holdings with no open sell orders:" in rendered
+    assert "Filled buys missing paired exits:" not in rendered
+    assert "Potential missing exits" not in rendered
+    assert "BIPC.TO" in rendered
 
 
 def test_chatgpt_handoff_lists_canonical_export_fills_only_once():
@@ -523,8 +582,162 @@ def test_filled_buy_with_no_current_holding_is_not_missing_exit():
         {"account": "TFSA", "ticker": "FM", "side": "buy", "status": "Completed", "quantity": "5 shares"},
         {"account": "RRSP", "ticker": "LUN", "side": "buy", "status": "Completed", "quantity": "10 shares"},
     ]
-    findings = filled_buy_exit_checks(activity, [], [{"account": "RRSP", "ticker": "LUN", "quantity": "10 shares"}])
-    assert [(row["account"], row["ticker"]) for row in findings] == [("RRSP", "LUN")]
+    # Historical filled buys never become actionable current-exit claims.
+    assert filled_buy_exit_checks(activity, [], [{"account": "RRSP", "ticker": "LUN", "quantity": "10 shares"}]) == []
+    paired = [
+        row for row in paired_exit_checks(
+            [{"account": "RRSP", "ticker": "LUN", "quantity": "10 shares"}],
+            [],
+            activity,
+        )
+        if row.get("type") == "holding_without_open_sell_exit"
+    ]
+    assert len(paired) == 1
+    assert paired[0]["account"] == "RRSP"
+    assert paired[0]["ticker"] == "LUN"
+    assert paired[0]["uncovered_quantity"] == "10"
+    # Closed FM (no current holding) must not appear in current holding gaps.
+    assert not any(row.get("ticker") == "FM" for row in paired)
+
+
+def test_adbe_closed_historical_buy_is_not_a_current_missing_exit_claim():
+    """Buy 100, sell 100, buy 10, hold 10 → current gap is 10 once, not 110."""
+    activity = [
+        {"account": "TFSA", "ticker": "ADBE", "side": "buy", "status": "Completed",
+         "quantity": "100", "execution_price": "$7.7 CAD", "filled_date": "2026-06-17"},
+        {"account": "TFSA", "ticker": "ADBE", "side": "sell", "status": "Completed",
+         "quantity": "100", "execution_price": "$8.63 CAD", "filled_date": "2026-07-15"},
+        {"account": "TFSA", "ticker": "ADBE", "side": "buy", "status": "Completed",
+         "quantity": "10", "execution_price": "$9.95 CAD", "filled_date": "2026-09-08"},
+    ]
+    holdings = [{"account": "TFSA", "ticker": "ADBE", "quantity": "10 shares", "current_price_currency": "CAD"}]
+    assert filled_buy_exit_checks(activity, [], holdings) == []
+    paired = [p for p in paired_exit_checks(holdings, [], activity) if p.get("type") == "holding_without_open_sell_exit"]
+    assert len(paired) == 1
+    assert paired[0]["account"] == "TFSA"
+    assert paired[0]["ticker"] == "ADBE"
+    assert paired[0]["uncovered_quantity"] == "10"
+    coverage = sell_order_coverage(holdings, [], inventory_complete=True)
+    assert coverage[0]["coverage_status"] == "uncovered"
+    assert coverage[0]["uncovered_quantity"] == "10"
+
+
+def test_bipc_missing_exit_is_not_omitted_or_covered_by_bepc_sells():
+    """BIPC and BEPC are distinct; BEPC sells must not silence BIPC gaps."""
+    holdings = [
+        {"account": "RRSP", "ticker": "BIPC.TO", "quantity": "4 shares", "current_price_currency": "CAD"},
+        {"account": "RRSP", "ticker": "BEPC.TO", "quantity": "12 shares", "current_price_currency": "CAD"},
+        {"account": "RRSP", "ticker": "BAM.TO", "quantity": "3 shares", "current_price_currency": "CAD"},
+    ]
+    orders = [
+        {"account": "RRSP", "ticker": "BEPC.TO", "side": "sell", "quantity": "2 shares",
+         "status": "Pending", "source_control_id": "bepc-1", "security_quote_currency": "CAD",
+         **quantity_evidence("2 shares", None, "2 shares")},
+        {"account": "RRSP", "ticker": "BEPC.TO", "side": "sell", "quantity": "3 shares",
+         "status": "Pending", "source_control_id": "bepc-2", "security_quote_currency": "CAD",
+         **quantity_evidence("3 shares", None, "3 shares")},
+    ]
+    paired = [p for p in paired_exit_checks(holdings, orders, []) if p.get("type") == "holding_without_open_sell_exit"]
+    by_ticker = {p["ticker"]: p for p in paired}
+    assert "BIPC.TO" in by_ticker
+    assert by_ticker["BIPC.TO"]["uncovered_quantity"] == "4"
+    assert "BAM.TO" in by_ticker
+    assert by_ticker["BAM.TO"]["uncovered_quantity"] == "3"
+    assert "BEPC.TO" not in by_ticker  # has open sells → partial coverage, not zero-exit alert
+    coverage = {
+        row["ticker"]: row
+        for row in sell_order_coverage(holdings, orders, inventory_complete=True)
+        if "coverage_status" in row
+    }
+    assert coverage["BIPC.TO"]["coverage_status"] == "uncovered"
+    assert coverage["BIPC.TO"]["uncovered_quantity"] == "4"
+    assert coverage["BEPC.TO"]["coverage_status"] == "partially_uncovered"
+    assert coverage["BEPC.TO"]["uncovered_quantity"] == "7"
+    assert coverage["BAM.TO"]["coverage_status"] == "uncovered"
+
+
+def test_account_separated_avgo_coverage_and_partial_bn_gap():
+    holdings = [
+        {"account": "RRSP", "ticker": "AVGO", "quantity": "22 shares", "current_price_currency": "CAD"},
+        {"account": "TFSA", "ticker": "AVGO", "quantity": "10 shares", "current_price_currency": "CAD"},
+        {"account": "RRSP", "ticker": "BN.TO", "quantity": "22 shares", "current_price_currency": "CAD"},
+    ]
+    orders = [
+        {"account": "RRSP", "ticker": "AVGO", "side": "sell", "quantity": "22 shares",
+         "status": "Pending", "source_control_id": "avgo-rrsp", "security_quote_currency": "CAD",
+         **quantity_evidence("22 shares", None, "22 shares")},
+        {"account": "RRSP", "ticker": "BN.TO", "side": "sell", "quantity": "2 shares",
+         "status": "Pending", "source_control_id": "bn-1", "security_quote_currency": "CAD",
+         **quantity_evidence("2 shares", None, "2 shares")},
+        {"account": "RRSP", "ticker": "BN.TO", "side": "sell", "quantity": "3 shares",
+         "status": "Pending", "source_control_id": "bn-2", "security_quote_currency": "CAD",
+         **quantity_evidence("3 shares", None, "3 shares")},
+    ]
+    coverage = {
+        (row["account"], row["ticker"]): row
+        for row in sell_order_coverage(holdings, orders, inventory_complete=True)
+        if "coverage_status" in row
+    }
+    assert coverage[("RRSP", "AVGO")]["coverage_status"] == "fully_covered"
+    assert coverage[("RRSP", "AVGO")]["uncovered_quantity"] == "0"
+    assert coverage[("TFSA", "AVGO")]["coverage_status"] == "uncovered"
+    assert coverage[("TFSA", "AVGO")]["uncovered_quantity"] == "10"
+    assert coverage[("RRSP", "BN.TO")]["coverage_status"] == "partially_uncovered"
+    assert coverage[("RRSP", "BN.TO")]["uncovered_quantity"] == "17"
+    paired = {
+        (p["account"], p["ticker"]): p
+        for p in paired_exit_checks(holdings, orders, [])
+        if p.get("type") == "holding_without_open_sell_exit"
+    }
+    assert ("TFSA", "AVGO") in paired and paired[("TFSA", "AVGO")]["uncovered_quantity"] == "10"
+    assert ("RRSP", "AVGO") not in paired
+    assert ("RRSP", "BN.TO") not in paired  # partial sells exist
+
+
+def test_bam_export_alias_and_partial_lot_without_silent_fifo():
+    """BAM vs BAM.TO normalize to one identity; buy 10 / sell 4 / hold 6 / live sell 2 → uncovered 4."""
+    holdings = [{"account": "RRSP", "ticker": "BAM.TO", "quantity": "6 shares", "current_price_currency": "CAD"}]
+    orders = [{
+        "account": "RRSP", "ticker": "BAM", "side": "sell", "quantity": "2 shares",
+        "status": "Pending", "source_control_id": "bam-1", "security_quote_currency": "CAD",
+        **quantity_evidence("2 shares", None, "2 shares"),
+    }]
+    activity = [
+        {"account": "RRSP", "ticker": "BAM", "side": "buy", "status": "Completed", "quantity": "10"},
+        {"account": "RRSP", "ticker": "BAM", "side": "sell", "status": "Completed", "quantity": "4"},
+    ]
+    assert normalize_ticker_for_cross_reference("BAM.TO") == normalize_ticker_for_cross_reference("BAM") == "BAM"
+    coverage = sell_order_coverage(holdings, orders, inventory_complete=True)[0]
+    assert coverage["coverage_status"] == "partially_uncovered"
+    assert coverage["uncovered_quantity"] == "4"
+    assert filled_buy_exit_checks(activity, orders, holdings) == []
+    # No zero-exit holding alert while a live sell exists.
+    assert not any(
+        p.get("type") == "holding_without_open_sell_exit"
+        for p in paired_exit_checks(holdings, orders, activity)
+    )
+
+
+def test_closed_position_historical_buy_is_not_current_missing_exit():
+    activity = [{"account": "TFSA", "ticker": "FM", "side": "buy", "status": "Completed", "quantity": "5"}]
+    assert filled_buy_exit_checks(activity, [], []) == []
+    assert not any(
+        p.get("type") == "holding_without_open_sell_exit"
+        for p in paired_exit_checks([], [], activity)
+    )
+
+
+def test_incomplete_inventory_qualifies_coverage_and_suppresses_definite_missing_exits():
+    holdings = [{"account": "RRSP", "ticker": "BIPC.TO", "quantity": "4 shares", "current_price_currency": "CAD"}]
+    coverage = sell_order_coverage(holdings, [], inventory_complete=False)[0]
+    assert coverage["coverage_status"] == "uncertain"
+    assert coverage["uncovered_quantity"] is None
+    # finalize strips holding_without_open_sell_exit when incomplete; function itself still
+    # reports the holding-level observation for callers that gate separately.
+    assert any(
+        p.get("ticker") == "BIPC.TO" and p.get("type") == "holding_without_open_sell_exit"
+        for p in paired_exit_checks(holdings, [], [])
+    )
 
 
 def test_sell_coverage_flags_only_real_oversell_or_missing_position():
@@ -690,6 +903,88 @@ def test_holding_row_strips_accessible_details_suffix_from_ticker():
     assert row["market_value"] == "$163.62 USD"
 
 
+def test_holding_row_strips_lowercase_details_suffix_retained_bam_to():
+    """Exact RRSP BAM.TO row retained in 20260917T060852-0300 account-balances.json.
+
+    Pre-fix capital-D-only matcher silently dropped this valid live row; the
+    corrected parser must accept lowercase ``details`` without weakening ticker
+    validation or inventing holdings from partial/prose cells.
+    """
+    cells = [
+        "BAM.TO details",
+        "CAD",
+        "5.93%",
+        "3",
+        "$63.19",
+        "$189.57",
+        "−$11.28",
+        "5.62%",
+    ]
+    # Demonstrate the pre-fix failure mode against the exact retained label.
+    assert re.fullmatch(r"([A-Z0-9.]+) Details", cells[0]) is None
+    row = parse_holdings_row_cells(
+        cells,
+        "RRSP",
+        {"url": "fixture"},
+        row_testid="holdings-row-f74f18fb79ff7f4d78b377c8a6e922f0",
+        href="/app/security-details/sec-s-5122ab124ce34e249203e3703b7942fd?account=rrsp-T-_do_5J_g&selectedAccount=rrsp-T-_do_5J_g",
+    )
+    assert row is not None
+    assert row["ticker"] == "BAM.TO"
+    assert row["account"] == "RRSP"
+    assert row["quantity"] == "3 shares"
+    assert row["current_price"] == "$63.19 CAD"
+    assert row["market_value"] == "$189.57 CAD"
+    assert row["holdings_row_testid"] == "holdings-row-f74f18fb79ff7f4d78b377c8a6e922f0"
+    assert row["row_account_slug"] == "rrsp-T-_do_5J_g"
+
+
+def test_holding_row_details_capitalization_bare_repeated_and_malformed():
+    capital = parse_holdings_row_cells(
+        ["MP Details", "USD", "100.00%", "3", "$54.54", "$163.62", "+$70.59", "75.89%"],
+        "Non-registered",
+        {},
+    )
+    assert capital is not None and capital["ticker"] == "MP"
+
+    bare = parse_holdings_row_cells(
+        ["BBUC.TO", "CAD", "1.00%", "2", "$10.00", "$20.00", "+$0.10", "0.50%"],
+        "RRSP",
+        {},
+    )
+    assert bare is not None and bare["ticker"] == "BBUC.TO" and bare["quantity"] == "2 shares"
+
+    repeated = parse_holdings_row_cells(
+        ["AVGO", "AVGO", "USD", "5.00%", "1", "$100.00", "$100.00", "+$1.00", "1.00%"],
+        "TFSA",
+        {},
+    )
+    assert repeated is not None and repeated["ticker"] == "AVGO" and repeated["quantity"] == "1 share"
+
+    bepc = parse_holdings_row_cells(
+        ["BEPC.TO", "CAD", "1.00%", "1", "$10.00", "$10.00"], "RRSP", {}
+    )
+    bipc = parse_holdings_row_cells(
+        ["BIPC.TO", "CAD", "1.00%", "1", "$10.00", "$10.00"], "RRSP", {}
+    )
+    assert bepc is not None and bipc is not None
+    assert bepc["ticker"] == "BEPC.TO" and bipc["ticker"] == "BIPC.TO"
+
+    # Arbitrary prose ending in details is not a ticker.
+    assert (
+        parse_holdings_row_cells(
+            ["View security details", "CAD", "1.00%", "3", "$63.19", "$189.57"],
+            "RRSP",
+            {},
+        )
+        is None
+    )
+    # Partial rows lacking currency, quantity, or two amounts stay dropped.
+    assert parse_holdings_row_cells(["BAM.TO details", "3", "$63.19", "$189.57"], "RRSP", {}) is None
+    assert parse_holdings_row_cells(["BAM.TO details", "CAD", "$63.19", "$189.57"], "RRSP", {}) is None
+    assert parse_holdings_row_cells(["BAM.TO details", "CAD", "5.93%", "3", "$63.19"], "RRSP", {}) is None
+
+
 def test_account_readiness_requires_rendered_grid_and_money_values():
     ready = {
         "url": "https://my.wealthsimple.com/app/account-details/tfsa-x",
@@ -768,7 +1063,11 @@ def test_sell_coverage_matches_suffixed_holdings_against_bare_orders():
 def test_paired_exit_special_ticker_matching_survives_the_to_suffix():
     holdings = [{"account": "TFSA", "ticker": "MDA.TO", "quantity": "7 shares"}]
     findings = paired_exit_checks(holdings, [], [{"ticker": "TD.TO"}])
-    assert {"type": "holding_without_open_sell_exit", "account": "TFSA", "ticker": "MDA.TO"} in findings
+    mda = next(f for f in findings if f.get("type") == "holding_without_open_sell_exit")
+    assert mda["account"] == "TFSA"
+    assert mda["ticker"] == "MDA.TO"
+    assert mda["normalized_ticker"] == "MDA"
+    assert mda["uncovered_quantity"] == "7"
     td = [f for f in findings if f.get("ticker") == "TD"][0]
     assert td["status"] == "activity_seen"
 
@@ -1870,9 +2169,15 @@ def test_pending_capture_scans_unfiltered_activity_after_clear(tmp_path):
     reader.go_app_path = lambda _path, _label: None
     reader.wait_for_activity_cards = lambda _purpose: True
     reader.wait_for_pending_activity_cards = lambda _purpose: True
-    reader.click_label = lambda label, **_kwargs: clicked.append(label) or True
+    reader.click_activity_filter_clear = lambda label="Clear": clicked.append(label) or True
+    reader.verify_activity_filter_defaults = lambda phase="unspecified": True
+    reader._record_broker_pending_count = lambda **kwargs: {
+        "value": 0, "unavailable": False, "phase": kwargs.get("phase"),
+    }
     reader.settle = lambda *_args, **_kwargs: True
     reader.disclosure_controls_present = lambda: True
+    reader.activity_filter_sidebar_settled = lambda: True
+    reader.body_text = lambda: "Pending\n0 transactions\n"
     reader.capture = lambda *_args, **_kwargs: {
         "visible_text": "",
         "screenshot": "",
@@ -1884,6 +2189,8 @@ def test_pending_capture_scans_unfiltered_activity_after_clear(tmp_path):
     _evidence, rows = reader.capture_activity()
 
     assert clicked == ["Clear"]
+    assert state.filter_observed_default_before is True
+    assert state.filter_observed_default_after is True
     assert state.pending_scan_complete is True
     assert rows == []
 
