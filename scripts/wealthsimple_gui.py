@@ -200,6 +200,7 @@ class WealthsimpleAuditApp(ttk.Frame):
         self.master = master
         self.pack(fill="both", expand=True)
         self.process: subprocess.Popen[str] | None = None
+        self.browser_operation = False
         self.downloaded_activity_csv: Path | None = None
         self.downloaded_holdings_csv: Path | None = None
         self.active_job = "capture"
@@ -247,11 +248,12 @@ class WealthsimpleAuditApp(ttk.Frame):
         ttk.Button(controls, text="Refresh reports", command=self.refresh_bundles).grid(row=0, column=2, padx=8)
         self.launch_browser_button = ttk.Button(
             controls,
-            text="Launch controlled browser",
+            text="Open controllable browser",
             command=self.launch_controlled_browser,
         )
         self.launch_browser_button.grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(controls, text="View browser", command=self.open_browser_viewer).grid(row=0, column=4, padx=8)
+        self.close_browser_button = ttk.Button(controls, text="Close controllable browser", command=self.close_controlled_browser)
+        self.close_browser_button.grid(row=0, column=4, padx=8)
         ttk.Label(controls, textvariable=self.browser_status_text).grid(row=0, column=5, padx=(12, 8), sticky="e")
         ttk.Label(controls, textvariable=self.status_text).grid(row=0, column=6, sticky="e")
 
@@ -502,6 +504,8 @@ class WealthsimpleAuditApp(ttk.Frame):
         return path
 
     def start_capture(self) -> None:
+        if getattr(self, "browser_operation", False):
+            return
         if self.process is not None and self.process.poll() is None:
             messagebox.showinfo("Capture running", "A capture is already running. Wait for it to complete.")
             return
@@ -594,6 +598,8 @@ class WealthsimpleAuditApp(ttk.Frame):
 
     def start_activity_download(self) -> None:
         """Run only the explicit read-only 12-month Activity CSV exporter."""
+        if getattr(self, "browser_operation", False):
+            return
         if self.process is not None and self.process.poll() is None:
             messagebox.showinfo("Task running", "Wait for the current read-only task to complete.")
             return
@@ -642,9 +648,12 @@ class WealthsimpleAuditApp(ttk.Frame):
 
     def launch_controlled_browser(self) -> None:
         """Start only the local dedicated browser service without navigating it."""
+        if getattr(self, "browser_operation", False):
+            return
         if self.process is not None and self.process.poll() is None:
             messagebox.showinfo("Capture running", "Wait for the current read-only task to finish before starting the browser.")
             return
+        self.browser_operation = True
         self.launch_browser_button.configure(state="disabled")
         self.status_text.set("Starting controlled browser")
         command = browser_control_launch_command()
@@ -656,9 +665,10 @@ class WealthsimpleAuditApp(ttk.Frame):
             result = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
             self.after(0, lambda: self._finish_controlled_browser_launch(result.returncode, result.stdout, result.stderr))
         except (OSError, subprocess.TimeoutExpired) as exc:
-            self.after(0, lambda: self._finish_controlled_browser_launch(1, "", str(exc)))
+            self.after(0, lambda error=str(exc): self._finish_controlled_browser_launch(1, "", error))
 
     def _finish_controlled_browser_launch(self, return_code: int, stdout: str, stderr: str) -> None:
+        self.browser_operation = False
         self.launch_browser_button.configure(state="normal")
         output = (stdout + stderr).strip()
         if output:
@@ -667,9 +677,41 @@ class WealthsimpleAuditApp(ttk.Frame):
         self.refresh_browser_status()
         if return_code == 0 and status.ready:
             self.status_text.set("Controlled browser ready. Sign in to Wealthsimple if prompted.")
+            self.open_browser_viewer()
             return
         self.status_text.set("Controlled browser did not start")
         messagebox.showerror("Controlled browser did not start", output or status.message)
+
+    def close_controlled_browser(self) -> None:
+        """Stop the dedicated service, retaining its persistent browser profile."""
+        if getattr(self, "browser_operation", False):
+            return
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showinfo("Capture running", "Wait for the current read-only task to finish before closing the browser.")
+            return
+        if not messagebox.askokcancel("Close controllable browser", "Stop the browser and its entire virtual desktop? Saved logins and the browser profile will be kept. Any capture started outside this app must finish first."):
+            return
+        self.browser_operation = True
+        self.status_text.set("Stopping browser and virtual desktop…")
+        threading.Thread(target=self._close_controlled_browser_worker, daemon=True).start()
+
+    def _close_controlled_browser_worker(self) -> None:
+        try:
+            result = subprocess.run([str(ROOT / "scripts/browser-control-stop.sh")], capture_output=True, text=True, timeout=40, check=False)
+            self.after(0, lambda: self._finish_controlled_browser_close(result.returncode, result.stdout + result.stderr))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.after(0, lambda error=str(exc): self._finish_controlled_browser_close(1, error))
+
+    def _finish_controlled_browser_close(self, return_code: int, output: str) -> None:
+        self.browser_operation = False
+        self.refresh_browser_status()
+        if output.strip():
+            self.append_log(output.strip())
+        if return_code == 0:
+            self.status_text.set("Browser and virtual desktop stopped. Saved profile retained.")
+        else:
+            self.status_text.set("Could not stop the controlled browser")
+            messagebox.showerror("Browser stop failed", output)
 
     def refresh_browser_status(self) -> None:
         status = inspect_browser_control()
@@ -820,7 +862,23 @@ class WealthsimpleAuditApp(ttk.Frame):
             f"Bundle: {bundle.directory}"
         )
         if warnings:
-            text += "\n\nTop warnings:\n" + "\n".join(f"- {item}" for item in warnings[:5])
+            residual_warnings = [
+                item for item in warnings
+                if "residual" in item.lower() or item.startswith("account total")
+            ]
+            completeness_warnings = [
+                item for item in warnings
+                if "completeness" in item.lower()
+                or "filter defaults" in item.lower()
+                or item.startswith("historical evidence gap")
+                or "pending-transaction count" in item.lower()
+            ]
+            other = [item for item in warnings if item not in residual_warnings + completeness_warnings]
+            text += "\n\nUnexplained residuals / completeness (always shown):\n" + "\n".join(
+                f"- {item}" for item in (residual_warnings + completeness_warnings) or ["None"]
+            )
+            if other:
+                text += "\n\nTop other warnings:\n" + "\n".join(f"- {item}" for item in other[:5])
         if blockers:
             text += "\n\nBlockers:\n" + "\n".join(f"- {item}" for item in blockers[:5])
         if performance:

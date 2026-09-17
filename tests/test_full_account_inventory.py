@@ -1870,9 +1870,15 @@ def test_pending_capture_scans_unfiltered_activity_after_clear(tmp_path):
     reader.go_app_path = lambda _path, _label: None
     reader.wait_for_activity_cards = lambda _purpose: True
     reader.wait_for_pending_activity_cards = lambda _purpose: True
-    reader.click_label = lambda label, **_kwargs: clicked.append(label) or True
+    reader.click_activity_filter_clear = lambda label="Clear": clicked.append(label) or True
+    reader.verify_activity_filter_defaults = lambda phase="unspecified": True
+    reader._record_broker_pending_count = lambda **kwargs: {
+        "value": 0, "unavailable": False, "phase": kwargs.get("phase"),
+    }
     reader.settle = lambda *_args, **_kwargs: True
     reader.disclosure_controls_present = lambda: True
+    reader.activity_filter_sidebar_settled = lambda: True
+    reader.body_text = lambda: "Pending\n0 transactions\n"
     reader.capture = lambda *_args, **_kwargs: {
         "visible_text": "",
         "screenshot": "",
@@ -1884,6 +1890,8 @@ def test_pending_capture_scans_unfiltered_activity_after_clear(tmp_path):
     _evidence, rows = reader.capture_activity()
 
     assert clicked == ["Clear"]
+    assert state.filter_observed_default_before is True
+    assert state.filter_observed_default_after is True
     assert state.pending_scan_complete is True
     assert rows == []
 

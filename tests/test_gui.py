@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from src.full_account_inventory import RunState, ensure_dirs, import_exports
 from scripts.wealthsimple_gui import (
@@ -26,6 +28,42 @@ from scripts.wealthsimple_gui import (
     save_export_paths,
 )
 from src.browser_control_preflight import inspect_browser_control
+
+
+def test_successful_browser_open_shows_viewer():
+    app = SimpleNamespace(browser_operation=True, launch_browser_button=Mock(), append_log=Mock(),
+                          refresh_browser_status=Mock(), status_text=Mock(), open_browser_viewer=Mock())
+    with patch("scripts.wealthsimple_gui.inspect_browser_control", return_value=SimpleNamespace(ready=True)):
+        WealthsimpleAuditApp._finish_controlled_browser_launch(app, 0, "", "")
+    app.open_browser_viewer.assert_called_once_with()
+    assert app.browser_operation is False
+
+
+def test_close_browser_refuses_active_capture():
+    app = SimpleNamespace(browser_operation=False, process=Mock())
+    app.process.poll.return_value = None
+    with patch("scripts.wealthsimple_gui.messagebox.showinfo") as info, patch("scripts.wealthsimple_gui.threading.Thread") as thread:
+        WealthsimpleAuditApp.close_controlled_browser(app)
+    info.assert_called_once()
+    thread.assert_not_called()
+
+
+def test_close_browser_cancel_preserves_session():
+    app = SimpleNamespace(browser_operation=False, process=None)
+    with patch("scripts.wealthsimple_gui.messagebox.askokcancel", return_value=False), patch("scripts.wealthsimple_gui.threading.Thread") as thread:
+        WealthsimpleAuditApp.close_controlled_browser(app)
+    thread.assert_not_called()
+    assert app.browser_operation is False
+
+
+def test_close_worker_uses_scoped_stop_script():
+    app = SimpleNamespace(after=Mock(), _finish_controlled_browser_close=Mock())
+    result = SimpleNamespace(returncode=0, stdout="Stopped", stderr="")
+    with patch("scripts.wealthsimple_gui.subprocess.run", return_value=result) as run:
+        WealthsimpleAuditApp._close_controlled_browser_worker(app)
+    assert run.call_args.args[0][0].endswith("scripts/browser-control-stop.sh")
+    app.after.call_args.args[1]()
+    app._finish_controlled_browser_close.assert_called_once_with(0, "Stopped")
 
 
 def test_capture_command_uses_read_only_runner():

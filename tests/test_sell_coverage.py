@@ -215,7 +215,14 @@ def test_parser_through_bundle_reports_and_legacy_rebuild(tmp_path):
     ensure_dirs(out)
     order, _ = detail(original="5", remaining="5")
     accounts = {a: {"account": a, "available_to_trade": "$10.00 CAD"} for a in ("TFSA", "RRSP", "Non-registered")}
-    state = RunState(out_dir=out, mode="FULL", pending_scan_complete=True)
+    state = RunState(
+        out_dir=out,
+        mode="FULL",
+        pending_scan_complete=True,
+        filter_observed_default_before=True,
+        filter_observed_default_after=True,
+        traversal_exhausted=True,
+    )
     write_bundle(state, accounts, [holding()], [order], [], [])
     report = json.loads((out / "sell-order-coverage.json").read_text())[0]
     assert report["uncovered_quantity"] == "7"
@@ -256,23 +263,35 @@ def test_unparsed_new_status_is_not_silent(status):
     assert unparsed_pending_controls([bad])
 
 
-@pytest.mark.parametrize("bottom,early_bad,reset,expected", [(True, False, True, True), (False, False, True, False), (True, True, True, False), (True, False, False, False)])
-def test_capture_completeness_and_earlier_viewport_miss(tmp_path, monkeypatch, bottom, early_bad, reset, expected):
+@pytest.mark.parametrize(
+    "bottom,early_bad,filters_ok,expected",
+    [
+        (True, False, True, True),
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, False, False),
+    ],
+)
+def test_capture_completeness_and_earlier_viewport_miss(tmp_path, monkeypatch, bottom, early_bad, filters_ok, expected):
     monkeypatch.setattr("src.full_account_inventory.time.sleep", lambda _: None)
     ensure_dirs(tmp_path)
     reader = WealthsimpleReader.__new__(WealthsimpleReader)
     reader.state = RunState(out_dir=tmp_path, mode="FULL")
     class Driver:
         current_url = "fixture"
-        def execute_script(self, script):
+        def execute_script(self, script, *args):
             return bottom if "return window.innerHeight" in script else None
     reader.driver = Driver()
     reader.go_app_path = lambda *a: None
     reader.wait_for_activity_cards = lambda *a: True
     reader.wait_for_pending_activity_cards = lambda *a: True
-    reader.click_label = lambda *a, **k: reset
+    reader.click_activity_filter_clear = lambda *a, **k: True
+    reader.verify_activity_filter_defaults = lambda phase="unspecified": filters_ok
+    reader._record_broker_pending_count = lambda **kwargs: {"value": None, "unavailable": True}
     reader.settle = lambda *a: True
     reader.disclosure_controls_present = lambda: True
+    reader.activity_filter_sidebar_settled = lambda: True
+    reader.body_text = lambda: ""
     reader.capture = lambda *a, **k: {"url": "fixture", "visible_text": "fixture", "screenshot": "fixture"}
     reader._find_safe_button = lambda *a: None
     calls = 0
@@ -293,17 +312,22 @@ def test_newly_exposed_bottom_viewport_is_parsed_before_completion(tmp_path, mon
     class Driver:
         current_url = "fixture"
         scrolls = 0
-        def execute_script(self, script):
+        def execute_script(self, script, *args):
             if "window.scrollBy" in script:
                 self.scrolls += 1
             if "return window.innerHeight" in script:
                 return self.scrolls >= 4
+            return None
     reader.driver = Driver()
     reader.go_app_path = lambda *a: None
     reader.wait_for_activity_cards = lambda *a: True
-    reader.click_label = lambda *a, **k: True
+    reader.click_activity_filter_clear = lambda *a, **k: True
+    reader.verify_activity_filter_defaults = lambda phase="unspecified": True
+    reader._record_broker_pending_count = lambda **kwargs: {"value": 1, "unavailable": False}
     reader.settle = lambda *a: True
     reader.disclosure_controls_present = lambda: True
+    reader.activity_filter_sidebar_settled = lambda: True
+    reader.body_text = lambda: "Pending\n1 transactions\n"
     reader.capture = lambda *a, **k: {"url": "fixture", "visible_text": "fixture", "screenshot": "fixture"}
     reader._find_safe_button = lambda *a: None
     reader.controls = lambda: [{"id": "last-row", "text": "XYZ\nLimit sell\nRRSP\n$120.00 CAD\nPartially filled"}] if reader.driver.scrolls >= 4 else []
