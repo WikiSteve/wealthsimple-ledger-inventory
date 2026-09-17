@@ -6678,15 +6678,15 @@ def render_next_message(manifest: dict[str, Any], summary: dict[str, Any]) -> st
     missing_exits = [
         f"- `{json.dumps(x)}`"
         for x in summary["paired_exit_checks"]
-        if x.get("type") != "special_attention_status"
+        if x.get("type") == "holding_without_open_sell_exit"
     ]
-    lines += ["", "Filled buys missing paired exits:", *(missing_exits or ["- None"])]
+    lines += ["", "Current holdings with no open sell orders:", *(missing_exits or ["- None"])]
     lines += [
         "",
         "Historical filled buys vs current missing exits:",
         "- Lot-level outstanding claims are not inferred from historical buys (no silent FIFO/allocation).",
         "- Canonical current uncovered quantities are in open-sell coverage and "
-        "`holding_without_open_sell_exit` alerts above.",
+        "the current-holdings section above.",
         "- Completed/fill history remains in the activity/export sections below.",
     ]
     if summary.get("filled_buy_exit_checks"):

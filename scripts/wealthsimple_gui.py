@@ -1009,7 +1009,7 @@ class WealthsimpleAuditApp(ttk.Frame):
         lines.extend(f"- {json.dumps(row)}" for row in duplicate) if duplicate else lines.append("- None found")
         lines += ["", "Open sell coverage:"]
         lines.extend(f"- {json.dumps(row)}" for row in sell_coverage) if sell_coverage else lines.append("- No oversell/missing-holding finding")
-        lines += ["", "Potential missing exits (current holdings with zero open sells):"]
+        lines += ["", "Current holdings with no open sell orders:"]
         missing = [row for row in paired if row.get("type") == "holding_without_open_sell_exit"]
         lines.extend(f"- {json.dumps(row)}" for row in missing) if missing else lines.append("- None found")
         special = [row for row in paired if row.get("type") == "special_attention_status"]
@@ -1020,7 +1020,7 @@ class WealthsimpleAuditApp(ttk.Frame):
             "",
             "Historical filled buys vs current missing exits:",
             "- Historical buys are not lot-attributed into actionable current-exit claims.",
-            "- Use open-sell coverage and the current holding gaps above for uncovered quantities.",
+            "- Use open-sell coverage and the current holdings section above for uncovered quantities.",
         ]
         if filled_buy_exits:
             lines.extend(f"- {json.dumps(row)}" for row in filled_buy_exits)

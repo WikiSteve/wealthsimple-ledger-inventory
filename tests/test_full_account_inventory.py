@@ -406,6 +406,64 @@ def test_chatgpt_handoff_ignores_non_status_findings_for_special_tickers():
     text = render_next_message(manifest, summary)
 
     assert "- QCOM: activity_seen" in text
+    assert "Current holdings with no open sell orders:" in text
+    assert "Filled buys missing paired exits:" not in text
+    assert '"ticker": "QCOM"' in text  # holding-level row still listed under current holdings
+
+
+def test_handoff_and_gui_use_current_holding_heading_not_filled_buy_wording():
+    """Visible wording must describe current holdings, not filled-buy derivation."""
+    from scripts.wealthsimple_gui import WealthsimpleAuditApp
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from pathlib import Path
+
+    summary = {
+        "accounts": [],
+        "holdings": [{"account": "RRSP", "ticker": "BIPC.TO", "quantity": "4 shares"}],
+        "open_orders": [],
+        "paired_exit_checks": [{
+            "type": "holding_without_open_sell_exit",
+            "account": "RRSP",
+            "ticker": "BIPC.TO",
+            "uncovered_quantity": "4",
+            "basis": "current_holding_inventory",
+        }],
+        "duplicate_checks": [],
+        "filled_buy_exit_checks": [],
+        "recent_activity": [],
+        "activity_status_counts": {},
+        "sell_order_coverage": [],
+        "cash_reserve_reconciliation": {},
+        "warnings": [],
+        "blockers": [],
+    }
+    handoff = render_next_message({"zip_path": "/tmp/x.zip", "status": "OK", "accounts_seen": ["RRSP"]}, summary)
+    assert "Current holdings with no open sell orders:" in handoff
+    assert "Filled buys missing paired exits:" not in handoff
+    assert "Potential missing exits" not in handoff
+    assert "Lot-level outstanding claims are not inferred" in handoff
+    assert "No per-buy actionable missing-exit claims" in handoff
+
+    # GUI checks pane uses the same current-state heading.
+    app = SimpleNamespace(
+        _load_json=lambda path, default: {
+            "duplicate-checks.json": [],
+            "paired-exit-checks.json": summary["paired_exit_checks"],
+            "filled-buy-exit-checks.json": [],
+            "sell-order-coverage.json": [],
+            "cash-reserve-reconciliation.json": {},
+        }.get(path.name, default),
+        checks_text=Mock(),
+        _set_text=Mock(),
+    )
+    bundle = SimpleNamespace(directory=Path("/tmp/fake-bundle"))
+    WealthsimpleAuditApp._render_checks(app, bundle)
+    rendered = app._set_text.call_args.args[1]
+    assert "Current holdings with no open sell orders:" in rendered
+    assert "Filled buys missing paired exits:" not in rendered
+    assert "Potential missing exits" not in rendered
+    assert "BIPC.TO" in rendered
 
 
 def test_chatgpt_handoff_lists_canonical_export_fills_only_once():
