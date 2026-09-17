@@ -3089,9 +3089,10 @@ def parse_holdings_row_cells(
     values = [cell for cell in (cells or []) if cell]
     if values:
         # A focused/hovered row can expose its accessible action label as the
-        # first cell (for example ``MP Details``) instead of the bare ticker.
-        # The remaining currency/quantity/value cells are unchanged.
-        details_match = re.fullmatch(r"([A-Z0-9.]+) Details", values[0])
+        # first cell (for example ``MP Details`` or ``BAM.TO details``) instead
+        # of the bare ticker. Live UI capitalization of "details" varies; keep
+        # ticker validation unchanged after stripping the suffix.
+        details_match = re.fullmatch(r"([A-Z0-9.]+) details", values[0], re.IGNORECASE)
         if details_match:
             values[0] = details_match.group(1)
     if not values or not looks_like_ticker(values[0]):
@@ -6255,7 +6256,13 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
         account["total_account_value"] = direct_value
         account["total_account_value_status"] = "directly_visible" if direct_value else "not_directly_visible_not_inferred"
     accounts_map = {a["account"]: a for a in accounts}
-    holdings = json.loads((out_dir / "holdings-all-accounts.json").read_text(encoding="utf-8"))
+    # Re-parse retained DOM/text holdings so parser corrections apply on rebuild
+    # instead of freezing a previously dropped row in holdings-all-accounts.json.
+    holdings = parse_holdings_from_account_texts(accounts_map)
+    if not holdings:
+        holdings_path = out_dir / "holdings-all-accounts.json"
+        if holdings_path.exists():
+            holdings = json.loads(holdings_path.read_text(encoding="utf-8"))
     orders = json.loads((out_dir / "open-orders-all-accounts.json").read_text(encoding="utf-8"))
     unresolved = json.loads((out_dir / "unresolved-row-only-orders.json").read_text(encoding="utf-8"))
     activity_path = out_dir / CURRENT_YEAR_ACTIVITY_JSON
@@ -6296,14 +6303,16 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
         pending_scan_complete=False,
         deposit_availability=old_manifest.get("deposit_availability") or [],
     )
-    # Preserve residual and completeness warnings; only drop warnings that are
-    # re-derived from current evidence with a more specific replacement cause.
+    # Preserve completeness warnings; drop warnings that write_bundle re-derives
+    # from current evidence (residuals, holdings quantity diffs, filter wording).
     state.warnings = [
         warning for warning in (old_manifest.get("warnings") or [])
         if not (
             (warning.startswith("visible non-target account card found:") and "cash-msb" in warning.lower())
             or warning.startswith("user-reported USD trading-account access needs reconfirmation")
             or "browser/export holding quantity difference(s) require review" in warning
+            or warning.startswith("account total not fully explained by visible cash")
+            or warning.startswith("account total residual unexplained by visible cash")
             # Replaced by historical evidence-gap / new filter-default wording.
             or warning.startswith("all-account Activity filter reset not confirmed")
         )

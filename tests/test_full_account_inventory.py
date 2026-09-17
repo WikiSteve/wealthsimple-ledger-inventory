@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -900,6 +901,88 @@ def test_holding_row_strips_accessible_details_suffix_from_ticker():
     assert row["ticker"] == "MP"
     assert row["quantity"] == "3 shares"
     assert row["market_value"] == "$163.62 USD"
+
+
+def test_holding_row_strips_lowercase_details_suffix_retained_bam_to():
+    """Exact RRSP BAM.TO row retained in 20260917T060852-0300 account-balances.json.
+
+    Pre-fix capital-D-only matcher silently dropped this valid live row; the
+    corrected parser must accept lowercase ``details`` without weakening ticker
+    validation or inventing holdings from partial/prose cells.
+    """
+    cells = [
+        "BAM.TO details",
+        "CAD",
+        "5.93%",
+        "3",
+        "$63.19",
+        "$189.57",
+        "−$11.28",
+        "5.62%",
+    ]
+    # Demonstrate the pre-fix failure mode against the exact retained label.
+    assert re.fullmatch(r"([A-Z0-9.]+) Details", cells[0]) is None
+    row = parse_holdings_row_cells(
+        cells,
+        "RRSP",
+        {"url": "fixture"},
+        row_testid="holdings-row-f74f18fb79ff7f4d78b377c8a6e922f0",
+        href="/app/security-details/sec-s-5122ab124ce34e249203e3703b7942fd?account=rrsp-T-_do_5J_g&selectedAccount=rrsp-T-_do_5J_g",
+    )
+    assert row is not None
+    assert row["ticker"] == "BAM.TO"
+    assert row["account"] == "RRSP"
+    assert row["quantity"] == "3 shares"
+    assert row["current_price"] == "$63.19 CAD"
+    assert row["market_value"] == "$189.57 CAD"
+    assert row["holdings_row_testid"] == "holdings-row-f74f18fb79ff7f4d78b377c8a6e922f0"
+    assert row["row_account_slug"] == "rrsp-T-_do_5J_g"
+
+
+def test_holding_row_details_capitalization_bare_repeated_and_malformed():
+    capital = parse_holdings_row_cells(
+        ["MP Details", "USD", "100.00%", "3", "$54.54", "$163.62", "+$70.59", "75.89%"],
+        "Non-registered",
+        {},
+    )
+    assert capital is not None and capital["ticker"] == "MP"
+
+    bare = parse_holdings_row_cells(
+        ["BBUC.TO", "CAD", "1.00%", "2", "$10.00", "$20.00", "+$0.10", "0.50%"],
+        "RRSP",
+        {},
+    )
+    assert bare is not None and bare["ticker"] == "BBUC.TO" and bare["quantity"] == "2 shares"
+
+    repeated = parse_holdings_row_cells(
+        ["AVGO", "AVGO", "USD", "5.00%", "1", "$100.00", "$100.00", "+$1.00", "1.00%"],
+        "TFSA",
+        {},
+    )
+    assert repeated is not None and repeated["ticker"] == "AVGO" and repeated["quantity"] == "1 share"
+
+    bepc = parse_holdings_row_cells(
+        ["BEPC.TO", "CAD", "1.00%", "1", "$10.00", "$10.00"], "RRSP", {}
+    )
+    bipc = parse_holdings_row_cells(
+        ["BIPC.TO", "CAD", "1.00%", "1", "$10.00", "$10.00"], "RRSP", {}
+    )
+    assert bepc is not None and bipc is not None
+    assert bepc["ticker"] == "BEPC.TO" and bipc["ticker"] == "BIPC.TO"
+
+    # Arbitrary prose ending in details is not a ticker.
+    assert (
+        parse_holdings_row_cells(
+            ["View security details", "CAD", "1.00%", "3", "$63.19", "$189.57"],
+            "RRSP",
+            {},
+        )
+        is None
+    )
+    # Partial rows lacking currency, quantity, or two amounts stay dropped.
+    assert parse_holdings_row_cells(["BAM.TO details", "3", "$63.19", "$189.57"], "RRSP", {}) is None
+    assert parse_holdings_row_cells(["BAM.TO details", "CAD", "$63.19", "$189.57"], "RRSP", {}) is None
+    assert parse_holdings_row_cells(["BAM.TO details", "CAD", "5.93%", "3", "$63.19"], "RRSP", {}) is None
 
 
 def test_account_readiness_requires_rendered_grid_and_money_values():
