@@ -5385,6 +5385,16 @@ def duplicate_checks(holdings: list[dict[str, Any]], orders: list[dict[str, Any]
 
 
 def paired_exit_checks(holdings: list[dict[str, Any]], orders: list[dict[str, Any]], activity: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Current holding-level missing-exit alerts for every captured position.
+
+    Uses the same account + normalized-ticker identity as sell coverage.
+    Exchange suffixes are stripped for matching only; display tickers are kept.
+    Distinct instruments such as BIPC and BEPC never share coverage by substring.
+    Partial open-sell coverage stays in sell_order_coverage — this list is only
+    for holdings with zero open sells.
+    """
+    from .sell_coverage import quantity as parse_quantity, units as format_units
+
     sell_keys = {
         (o.get("account"), normalize_ticker_for_cross_reference(o.get("ticker")))
         for o in orders if o.get("side") == "sell" and order_state(o.get("status")) != "terminal"
@@ -5392,8 +5402,23 @@ def paired_exit_checks(holdings: list[dict[str, Any]], orders: list[dict[str, An
     checks = []
     for h in holdings:
         normalized = normalize_ticker_for_cross_reference(h.get("ticker"))
-        if normalized in SPECIAL_TICKERS and (h.get("account"), normalized) not in sell_keys:
-            checks.append({"type": "holding_without_open_sell_exit", "account": h.get("account"), "ticker": h.get("ticker")})
+        if not normalized:
+            continue
+        key = (h.get("account"), normalized)
+        if key in sell_keys:
+            continue
+        held = parse_quantity(h.get("quantity"))
+        checks.append({
+            "type": "holding_without_open_sell_exit",
+            "account": h.get("account"),
+            "ticker": h.get("ticker"),
+            "normalized_ticker": normalized,
+            "holding_quantity": format_units(held),
+            "uncovered_quantity": format_units(held),
+            "open_sell_orders_found": 0,
+            "coverage_status": "uncovered",
+            "basis": "current_holding_inventory",
+        })
     for ticker in ["QCOM", "CVS", "UPS", "TD"]:
         matching_activity = [
             a for a in activity if normalize_ticker_for_cross_reference(a.get("ticker")) == ticker
@@ -5491,35 +5516,18 @@ def sell_order_coverage(holdings: list[dict[str, Any]], orders: list[dict[str, A
 
 
 def filled_buy_exit_checks(activity: list[dict[str, Any]], orders: list[dict[str, Any]], holdings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    sell_keys = {
-        (order.get("account"), normalize_ticker_for_cross_reference(order.get("ticker")))
-        for order in orders if order.get("side") == "sell" and order_state(order.get("status")) != "terminal"
-    }
-    currently_held = {
-        (holding.get("account"), normalize_ticker_for_cross_reference(holding.get("ticker")))
-        for holding in holdings
-    }
-    checks: list[dict[str, Any]] = []
-    for row in activity:
-        if row.get("side") != "buy" or row.get("status") not in {"Completed", "Filled", "Completed/Filled"}:
-            continue
-        key = (row.get("account"), normalize_ticker_for_cross_reference(row.get("ticker")))
-        # A completed buy with no remaining holding is not missing an exit: it
-        # may have been fully sold in the same capture window (FM was the live
-        # regression case). Only current positions without an open sell are
-        # operationally actionable as a missing exit.
-        if not key[1] or key in sell_keys or key not in currently_held:
-            continue
-        checks.append({
-            "type": "filled_buy_without_open_sell_exit",
-            "account": key[0],
-            "ticker": key[1],
-            "quantity": row.get("quantity"),
-            "execution_price": row.get("execution_price"),
-            "filled_date": row.get("filled_date") or row.get("date"),
-            "detail_status": row.get("detail_status"),
-        })
-    return checks
+    """Do not turn historical filled buys into actionable current-exit claims.
+
+    A completed buy while a position is currently held does not prove that buy's
+    quantity is still outstanding. Lot attribution would require complete history
+    plus an explicit allocation rule (FIFO etc.), which this tool does not invent.
+    Canonical current gaps live in ``holding_without_open_sell_exit`` and
+    ``sell_order_coverage``. Historical buys remain in activity/export evidence.
+
+    Closed positions (held 0) never produce a current missing-exit claim here.
+    """
+    del activity, orders, holdings
+    return []
 
 
 def quantity_as_float(value: str | None) -> float | None:
@@ -6315,27 +6323,62 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
             state.warn("copied performance log was invalid and could not be preserved")
 
     # Rehydrate filter / broker-count evidence from retained capture artifacts.
+    # Prefer explicit before/after phase logs when the live capture retained them.
+    # Only mark post-traversal as historically unobserved when no after-phase
+    # artifact exists — do not discard retained after-traversal proof.
+    before_filter_path = out_dir / "logs" / "activity-filter-state-before-traversal.json"
+    after_filter_path = out_dir / "logs" / "activity-filter-state-after-traversal.json"
     filter_state_path = out_dir / "logs" / "activity-filter-state.json"
-    if filter_state_path.exists():
-        try:
+
+    def _filter_confirmed(payload: dict[str, Any]) -> bool | None:
+        snapshot = payload.get("snapshot")
+        if snapshot is not None:
+            # Reinterpret retained DOM snapshot under the current verifier.
+            return confirms_unfiltered(snapshot)
+        if "confirmed_unfiltered" in payload and payload.get("confirmed_unfiltered") is not None:
+            return bool(payload.get("confirmed_unfiltered"))
+        return None
+
+    try:
+        if before_filter_path.exists():
+            before_filter = json.loads(before_filter_path.read_text(encoding="utf-8"))
+            state.filter_observed_default_before = _filter_confirmed(before_filter)
+            state.filter_reset_attempted = bool(before_filter.get("reset_attempted", False))
+            state.filter_reset_click_succeeded = bool(before_filter.get("reset_click_succeeded", False))
+        if after_filter_path.exists():
+            after_filter = json.loads(after_filter_path.read_text(encoding="utf-8"))
+            state.filter_observed_default_after = _filter_confirmed(after_filter)
+            # After-phase reset fields are authoritative when present.
+            if "reset_attempted" in after_filter:
+                state.filter_reset_attempted = bool(after_filter.get("reset_attempted", False))
+            if "reset_click_succeeded" in after_filter:
+                state.filter_reset_click_succeeded = bool(after_filter.get("reset_click_succeeded", False))
+        elif filter_state_path.exists():
             filter_state = json.loads(filter_state_path.read_text(encoding="utf-8"))
-            snapshot = filter_state.get("snapshot")
-            observed = confirms_unfiltered(snapshot) if snapshot is not None else None
-            # Reinterpret retained snapshot; do not invent a post-traversal observation.
-            state.filter_observed_default_before = observed
-            state.filter_observed_default_after = None  # not_observed_historically
-            state.filter_reset_attempted = bool(filter_state.get("reset_attempted", False))
-            state.filter_reset_click_succeeded = bool(filter_state.get("reset_click_succeeded", False))
-            # Legacy captures recorded confirmed_unfiltered under the old verifier.
+            if state.filter_observed_default_before is None:
+                if filter_state.get("observed_default_before") is not None:
+                    state.filter_observed_default_before = bool(filter_state.get("observed_default_before"))
+                else:
+                    state.filter_observed_default_before = _filter_confirmed(filter_state)
+            if filter_state.get("observed_default_after") is not None:
+                state.filter_observed_default_after = bool(filter_state.get("observed_default_after"))
+            else:
+                # Combined log without an after-phase file cannot invent after.
+                state.filter_observed_default_after = None
+            state.filter_reset_attempted = bool(filter_state.get("reset_attempted", state.filter_reset_attempted))
+            state.filter_reset_click_succeeded = bool(
+                filter_state.get("reset_click_succeeded", state.filter_reset_click_succeeded)
+            )
             if "reset_attempted" not in filter_state and "explicit filter reset" in str(
                 old_manifest.get("sell_coverage_scope") or ""
             ):
-                # Unsupported explicit-reset wording: do not invent a reset action.
                 state.filter_reset_attempted = False
                 state.filter_reset_click_succeeded = False
-        except json.JSONDecodeError:
-            state.warn("copied activity filter state was invalid and could not be preserved")
-    else:
+        elif not before_filter_path.exists():
+            state.filter_observed_default_before = None
+            state.filter_observed_default_after = None
+    except json.JSONDecodeError:
+        state.warn("copied activity filter state was invalid and could not be preserved")
         state.filter_observed_default_before = None
         state.filter_observed_default_after = None
 
@@ -6355,22 +6398,36 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
         except json.JSONDecodeError:
             state.traversal_exhausted = False
 
-    # Broker count from retained activity-start text when available.
-    activity_start = out_dir / "visible-text" / "activity" / "activity-start.txt"
-    if activity_start.exists():
-        count_value = parse_broker_pending_count(activity_start.read_text(encoding="utf-8", errors="replace"))
-        # Historical captures typically retain one reading; treat as after-or-only partial.
-        observation = make_count_observation(
-            count_value,
-            scope="all_accounts_activity",
-            account_filter="all",
-            status_filter="pending_transactions_label",
-            population_meaning="broker_visible_pending_transactions",
-            timestamp=old_manifest.get("generated_at"),
-            source="historical_activity_start_visible_text",
-        )
-        state.broker_pending_count_before = None
-        state.broker_pending_count_after = observation
+    # Broker counts from retained before/after observations when available.
+    before_count_path = out_dir / "logs" / "broker-pending-count-before_traversal.json"
+    after_count_path = out_dir / "logs" / "broker-pending-count-after_traversal.json"
+    if before_count_path.exists():
+        try:
+            state.broker_pending_count_before = json.loads(before_count_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state.warn("copied broker pending count before-traversal was invalid")
+    if after_count_path.exists():
+        try:
+            state.broker_pending_count_after = json.loads(after_count_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state.warn("copied broker pending count after-traversal was invalid")
+    elif not state.broker_pending_count_after:
+        # Fall back to a single activity-start reading when only one text snapshot exists.
+        activity_start = out_dir / "visible-text" / "activity" / "activity-start.txt"
+        if activity_start.exists():
+            count_value = parse_broker_pending_count(activity_start.read_text(encoding="utf-8", errors="replace"))
+            observation = make_count_observation(
+                count_value,
+                scope="all_accounts_activity",
+                account_filter="all",
+                status_filter="pending_transactions_label",
+                population_meaning="broker_visible_pending_transactions",
+                timestamp=old_manifest.get("generated_at"),
+                source="historical_activity_start_visible_text",
+            )
+            if state.broker_pending_count_before is None:
+                state.broker_pending_count_before = None
+            state.broker_pending_count_after = observation
 
     # Restore export inputs so rebuild does not silently drop CSV corroboration.
     exports: dict[str, Any] = {}
@@ -6618,8 +6675,25 @@ def render_next_message(manifest: dict[str, Any], summary: dict[str, Any]) -> st
     noc_accounts = sorted({h.get("account") for h in summary["holdings"] if h.get("ticker") == "NOC"})
     lines += ["", f"NOC duplicate status: {'held in ' + ', '.join(noc_accounts) if len(noc_accounts) > 1 else 'not duplicated across captured holdings'}"]
     lines += ["", "Duplicate warnings:", *[f"- `{json.dumps(x)}`" for x in summary["duplicate_checks"]]]
-    lines += ["", "Filled buys missing paired exits:", *[f"- `{json.dumps(x)}`" for x in summary["paired_exit_checks"] if x.get("type") != "special_attention_status"]]
-    lines += ["", "Completed filled buys missing a current open exit:", *[f"- `{json.dumps(x)}`" for x in summary.get("filled_buy_exit_checks", [])]]
+    missing_exits = [
+        f"- `{json.dumps(x)}`"
+        for x in summary["paired_exit_checks"]
+        if x.get("type") != "special_attention_status"
+    ]
+    lines += ["", "Filled buys missing paired exits:", *(missing_exits or ["- None"])]
+    lines += [
+        "",
+        "Historical filled buys vs current missing exits:",
+        "- Lot-level outstanding claims are not inferred from historical buys (no silent FIFO/allocation).",
+        "- Canonical current uncovered quantities are in open-sell coverage and "
+        "`holding_without_open_sell_exit` alerts above.",
+        "- Completed/fill history remains in the activity/export sections below.",
+    ]
+    if summary.get("filled_buy_exit_checks"):
+        lines += ["- Retained informational rows (not lot-attributed actionable claims):",
+                  *[f"- `{json.dumps(x)}`" for x in summary.get("filled_buy_exit_checks", [])]]
+    else:
+        lines.append("- No per-buy actionable missing-exit claims (by design).")
     lines += ["", render_coverage(summary.get("sell_order_coverage", []))]
     lines += ["", "Recent activity status counts:", f"- `{json.dumps(summary.get('activity_status_counts', {}))}`"]
     completed = [row for row in summary["recent_activity"] if row.get("status") in {"Completed", "Filled", "Completed/Filled"}]
