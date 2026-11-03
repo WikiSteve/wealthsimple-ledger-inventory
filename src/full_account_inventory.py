@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from .account_summary import ACCOUNT_SUMMARY_SCRIPT, native_cash_value
 
 from .browser_control_preflight import chromedriver_path, inspect_browser_control
 from .export_receipt import validate_activity_receipt
 from .activity_filter_evidence import (
-    FILTER_GROUPS, FILTER_SNAPSHOT_SCRIPT, FILTER_CLEAR_CLICK_SCRIPT,
+    FILTER_GROUPS, FILTER_ROOT_SCRIPT, FILTER_SNAPSHOT_SCRIPT, FILTER_CLEAR_CLICK_SCRIPT,
     CLEAR_LABEL_CANONICAL, clear_label_matches, confirms_unfiltered,
 )
 from .inventory_completeness import (
@@ -529,11 +530,8 @@ class WealthsimpleReader:
     def activity_filter_sidebar_settled(self) -> bool:
         """Edge-triggered: targeted groups expanded and control count stable across polls."""
         result = self.driver.execute_script(
-            """
+            FILTER_ROOT_SCRIPT + """
             const names = arguments[0];
-            const search = document.querySelector('[data-testid="filter-search"]');
-            let root = search;
-            while (root && !(root.innerText || '').trim().startsWith('Filters')) root = root.parentElement;
             if (!root) return {ok:false, count:0};
             const buttons = Array.from(root.querySelectorAll('button'));
             const expanded = names.every(name => {
@@ -1002,6 +1000,12 @@ class WealthsimpleReader:
         readiness["verified_empty_by_fresh_holdings_export"] = (
             self.expected_security_holdings.get(account) == 0
         )
+        summary = self.driver.execute_script(ACCOUNT_SUMMARY_SCRIPT) or {}
+        if summary.get("account") == account:
+            readiness["account_summary_dom"] = summary
+            readiness["available_cad_value"] = (
+                native_cash_value(summary, "CAD") or readiness.get("available_cad_value")
+            )
         return readiness
 
     def wait_for_account_content(
@@ -1157,6 +1161,22 @@ class WealthsimpleReader:
         entry = parse_account_identity_and_balance(
             text, account, ev, tooltip_text, tooltip_ev
         )
+        summary = (readiness or {}).get("account_summary_dom") or {}
+        if summary.get("account") == account:
+            entry["account_summary_dom"] = summary
+            write_json(self.state.out_dir / "logs" / f"account-summary-{section}.json", summary)
+            if looks_like_money(summary.get("account_value")):
+                entry["total_account_value"] = summary["account_value"]
+                entry["total_account_value_status"] = "directly_visible_account_value_graph_cad"
+            if looks_like_money(summary.get("total_cash_cad")):
+                entry["available_to_trade"] = summary["total_cash_cad"]
+                entry["available_cash"] = summary["total_cash_cad"]
+                entry["buying_power"] = summary["total_cash_cad"]
+                entry["cash_values_rendered"] = True
+            for currency in ("CAD", "USD"):
+                amount = native_cash_value(summary, currency)
+                if looks_like_money(amount):
+                    entry[f"available_cash_{currency.lower()}"] = amount
         entry["overview_evidence"] = home_ev
         entry["page_readiness"] = readiness
         entry["holdings_rows_dom"] = dom_rows
@@ -1880,9 +1900,7 @@ class WealthsimpleReader:
         """Expand only filter disclosures, inspect selections, then restore layout."""
         opened = []
         snapshot = None
-        toggle = """
-        let root = document.querySelector('[data-testid="filter-search"]');
-        while(root && !(root.innerText || '').trim().startsWith('Filters')) root=root.parentElement;
+        toggle = FILTER_ROOT_SCRIPT + """
         if(!root) return false;
         const matches=Array.from(root.querySelectorAll('button')).filter(e=>e.innerText.trim()===arguments[0]);
         if(matches.length!==1 || matches[0].getAttribute('aria-expanded')!==arguments[1]) return false;
@@ -6243,6 +6261,15 @@ def rebuild_bundle_from_existing(source_dir: Path, out_dir: Path | None = None) 
     # the total value. Re-evaluate copied evidence so a rebuild cannot retain
     # a position/order amount masquerading as an account balance.
     for account in accounts:
+        # The current account graph repeats animated digits in visible text.
+        # Preserve its separately captured, currency-labelled DOM observation.
+        summary_path = out_dir / "logs" / f"account-summary-{ACCOUNT_SLUG.get(account.get('account'), '')}.json"
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary.get("account") == account.get("account") and looks_like_money(summary.get("account_value")):
+                account["total_account_value"] = summary["account_value"]
+                account["total_account_value_status"] = "directly_visible_account_value_graph_cad"
+                continue
         if account.get("account") in home_values:
             account["total_account_value"] = home_values[account["account"]]
             account["total_account_value_status"] = "directly_visible_home_card_currency_unlabeled"
