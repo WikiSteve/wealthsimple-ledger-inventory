@@ -15,8 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.download_wealthsimple_activity_csv import (
+    DOCUMENTS_DIALOG_TESTID,
     attach_driver,
     click_all_accounts,
+    click_export_option,
     click_testid,
     dismiss_modal_with_escape,
     new_csv,
@@ -30,7 +32,6 @@ from scripts.download_wealthsimple_activity_csv import (
 DOCUMENTS_URL = "https://my.wealthsimple.com/app/docs"
 GENERATE_BUTTON_TESTID = "row-custom-download"
 TYPE_SELECTOR_TESTID = "button-generate-documents-type-selector"
-HOLDINGS_OPTION_TESTID = "select-input-option-holdings-report-csv"
 NEXT_BUTTON_TESTID = "button-holdings-report-next"
 DOWNLOAD_BUTTON_TESTID = "generate-documents-cta-button"
 CSV_REQUIRED_COLUMNS = {"Account Type", "Symbol", "Quantity", "Market Value"}
@@ -77,13 +78,18 @@ def download_holdings_csv(download_dir: Path) -> dict[str, Any]:
         # The document-type list is a React popover.  It is normally quick,
         # but two seconds is not a reliable readiness contract on a waking
         # browser/profile; the option can appear just after that deadline.
-        if not wait_until(lambda: testid_is_visible(driver, HOLDINGS_OPTION_TESTID), 12, 0.25):
+        if not wait_until(lambda: bool(driver.execute_script(
+            "const s=document.querySelector('[data-testid=button-generate-documents-type-selector]');"
+            "const list=s && document.getElementById(s.getAttribute('aria-controls'));"
+            "return list && Array.from(list.querySelectorAll('[role=option]')).some(e=>"
+            "e.innerText.trim()==='Holdings report (CSV)' && e.getBoundingClientRect().height>0);"
+        )), 12, 0.25):
             raise RuntimeError("document type choices did not open")
-        click_testid(driver, HOLDINGS_OPTION_TESTID, "Holdings report (CSV)")
+        click_export_option(driver, "Holdings report (CSV)", DOCUMENTS_DIALOG_TESTID, TYPE_SELECTOR_TESTID)
         click_testid(driver, NEXT_BUTTON_TESTID, "Next")
         if not wait_until(lambda: testid_is_visible(driver, DOWNLOAD_BUTTON_TESTID), 5):
             raise RuntimeError("Holdings report account step did not render")
-        click_all_accounts(driver)
+        click_all_accounts(driver, DOCUMENTS_DIALOG_TESTID)
         if not wait_until(lambda: bool(driver.execute_script(
             "const button=document.querySelector('[data-testid=generate-documents-cta-button]'); return button && !button.disabled"
         )), 10, 0.25):

@@ -40,6 +40,7 @@ ACTIVITY_READY_TIMEOUT_SECONDS = 45
 ACTIVITY_LOAD_ATTEMPTS = 2
 EXPORT_BUTTON_TESTID = "button-download-activities"
 EXPORT_DIALOG_TESTID = "button-download-activities-modal"
+DOCUMENTS_DIALOG_TESTID = "button-generate-documents-modal"
 PERIOD_SELECTOR_TESTID = "activities-export-period-selector"
 NEXT_BUTTON_TESTID = "button-activities-export-next"
 DOWNLOAD_BUTTON_TESTID = "generate-documents-cta-button"
@@ -100,17 +101,18 @@ def visible_export_dialog_heading(driver: "webdriver.Chrome") -> str | None:
 
 
 def visible_modal_heading(driver: "webdriver.Chrome") -> str | None:
-    """Return the top visible generic modal heading for the Documents wizard."""
+    """Read the named Documents wizard, independent of its aria-modal spelling."""
     return driver.execute_script(
         r"""
-        const dialog = Array.from(document.querySelectorAll('[role="dialog"][aria-modal="true"]'))
-          .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
-          .pop();
+        const dialog = document.querySelector(`[data-testid="${arguments[0]}"][role="dialog"]`);
         if (!dialog) return null;
+        const r = dialog.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || getComputedStyle(dialog).visibility === 'hidden') return null;
         const heading = dialog.querySelector('h1,h2,h3');
         return ((heading ? heading.innerText : dialog.innerText) || 'unnamed dialog')
           .replace(/\s+/g, ' ').trim().slice(0, 80);
-        """
+        """,
+        DOCUMENTS_DIALOG_TESTID,
     )
 
 
@@ -231,13 +233,17 @@ def testid_is_visible(driver: "webdriver.Chrome", testid: str) -> bool:
     ))
 
 
-def click_export_option(driver: "webdriver.Chrome", text: str) -> None:
-    """Choose an exact option from the export period selector's linked listbox."""
+def click_export_option(
+    driver: "webdriver.Chrome", text: str,
+    dialog_testid: str = EXPORT_DIALOG_TESTID,
+    selector_testid: str = PERIOD_SELECTOR_TESTID,
+) -> None:
+    """Choose an exact visible option from the named export selector's listbox."""
     clicked = driver.execute_script(
         r"""
-        const dialog = document.querySelector('[data-testid="button-download-activities-modal"]');
+        const dialog = document.querySelector(`[data-testid="${arguments[1]}"]`);
         if (!dialog) return {ok:false, reason:'export dialog missing'};
-        const selector = dialog.querySelector('[data-testid="activities-export-period-selector"]');
+        const selector = dialog.querySelector(`[data-testid="${arguments[2]}"]`);
         const listbox = selector && document.getElementById(selector.getAttribute('aria-controls'));
         if (!listbox) return {ok:false, reason:'export period listbox missing'};
         const expected = arguments[0];
@@ -250,6 +256,8 @@ def click_export_option(driver: "webdriver.Chrome", text: str) -> None:
         return {ok:true};
         """,
         text,
+        dialog_testid,
+        selector_testid,
     )
     if not clicked or not clicked.get("ok"):
         raise RuntimeError(f"refused export period option {text!r}: {clicked}")

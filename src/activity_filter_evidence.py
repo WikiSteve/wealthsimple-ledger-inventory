@@ -5,28 +5,39 @@ from __future__ import annotations
 import re
 from typing import Any
 
-FILTER_GROUPS = ("Quick filters", "Account", "Type", "Holdings", "Timeframe", "Status")
-SELECTION_GROUPS = ("Account", "Type", "Holdings", "Status")
+LEGACY_FILTER_GROUPS = ("Quick filters", "Account", "Type", "Holdings", "Timeframe", "Status")
+FILTER_GROUPS = ("Quick filters", "Account", "Type", "Holdings", "Indexes", "Timeframe", "Status")
+SELECTION_GROUPS = ("Account", "Type", "Holdings", "Indexes", "Status")
 
 # Shared with Clear click scoping: action and clear_present must agree.
 CLEAR_LABEL_RE = re.compile(r"^Clear(?: all)?$|^Clear filters$|^Clear search$", re.IGNORECASE)
 CLEAR_LABEL_CANONICAL = ("Clear", "Clear all", "Clear filters", "Clear search")
 
-FILTER_SNAPSHOT_SCRIPT = """
+FILTER_ROOT_SCRIPT = """
+const sidebars = Array.from(document.querySelectorAll('[role="group"][aria-label="Filters"]'));
+let root = sidebars.length === 1 ? sidebars[0] : null;
 const search = document.querySelector('[data-testid="filter-search"]');
-let root = search;
-while (root && !(root.innerText || '').trim().startsWith('Filters')) root = root.parentElement;
+if (!root && sidebars.length === 0) {
+  root = search;
+  while (root && !(root.innerText || '').trim().startsWith('Filters')) root = root.parentElement;
+}
+"""
+
+FILTER_SNAPSHOT_SCRIPT = FILTER_ROOT_SCRIPT + """
 if (!root) return null;
 const names = arguments[0];
 const buttons = Array.from(root.querySelectorAll('button'));
 return {
-  search: search.value,
+  layout: root.matches('[role="group"][aria-label="Filters"]') ? 'group' : 'legacy',
+  search: search ? search.value : "",
   groups: names.map(name => {
     const matches = buttons.filter(b => b.innerText.trim() === name);
     if (matches.length !== 1) return {name, ambiguous: true};
     const b = matches[0], panel = b.parentElement;
     return {name, expanded: b.getAttribute('aria-expanded'),
-      checkboxes: Array.from(panel.querySelectorAll('input[type="checkbox"]')).map(e => e.checked),
+      checkboxes: Array.from(panel.querySelectorAll('input[type="checkbox"]')).map(e => e.checked)
+        .concat(Array.from(panel.querySelectorAll('[role="switch"]')).map(e =>
+          e.getAttribute("aria-checked") === "false" ? false : e.getAttribute("aria-checked") === "true" ? true : null)),
       radios: Array.from(panel.querySelectorAll('input[type="radio"]')).map(e => ({value:e.value, checked:e.checked})),
       pressed: Array.from(panel.querySelectorAll('[aria-pressed]')).map(e => e.getAttribute('aria-pressed'))};
   }),
@@ -35,11 +46,8 @@ return {
 """
 
 # Sidebar-scoped Clear click: never search the whole document.
-FILTER_CLEAR_CLICK_SCRIPT = """
+FILTER_CLEAR_CLICK_SCRIPT = FILTER_ROOT_SCRIPT + """
 const label = arguments[0], exact = arguments[1];
-const search = document.querySelector('[data-testid="filter-search"]');
-let root = search;
-while (root && !(root.innerText || '').trim().startsWith('Filters')) root = root.parentElement;
 if (!root) return {ok:false, reason:'no_sidebar'};
 const els = Array.from(root.querySelectorAll('a,button,[role="button"],[role="menuitem"]'));
 const normalize = (t) => (t || '').trim().replace(/\\s+/g, ' ');
@@ -105,7 +113,11 @@ def confirms_unfiltered(snapshot: Any) -> bool:
     if not isinstance(snapshot, dict) or snapshot.get("search") != "" or snapshot.get("clear_present") is not False:
         return False
     groups = snapshot.get("groups")
-    if not isinstance(groups, list) or [g.get("name") for g in groups] != list(FILTER_GROUPS):
+    if not isinstance(groups, list) or any(not isinstance(g, dict) for g in groups):
+        return False
+    if [g.get("name") for g in groups] not in [list(FILTER_GROUPS), list(LEGACY_FILTER_GROUPS)]:
+        return False
+    if snapshot.get("layout") == "group" and [g.get("name") for g in groups] != list(FILTER_GROUPS):
         return False
     for group in groups:
         if not isinstance(group, dict) or group.get("ambiguous") or group.get("expanded") != "true":
